@@ -3753,6 +3753,59 @@ class TestFlatChannelPatterns:
         )
 
     @pytest.mark.asyncio
+    async def test_matching_channel_is_free_response_no_mention_needed(self, adapter):
+        """A flat-pattern channel processes messages WITHOUT an @-mention.
+
+        A channel named after the bot is a dedicated surface; every message
+        addresses the bot, so the mention gate is skipped for it.
+        """
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["ghost-*"],
+            }
+        )
+        adapter._channel_name_cache["C_GHOST"] = "ghost-project"
+        adapter._channel_dm_cache["C_GHOST"] = False
+        event = self._event(
+            "C_GHOST", ts="1111.0001", text="no mention here at all"
+        )
+        msg = await self._handle(adapter, event)
+        assert msg.source.thread_id is None
+
+    @pytest.mark.asyncio
+    async def test_non_matching_channel_still_requires_mention(self, adapter):
+        """Mention gating is unchanged outside pattern-matched channels."""
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["ghost-*"],
+            }
+        )
+        adapter._channel_name_cache["C_OTHER"] = "general"
+        adapter._channel_dm_cache["C_OTHER"] = False
+        event = self._event("C_OTHER", ts="1111.0002", text="no mention here")
+        with (
+            patch.object(
+                adapter,
+                "_resolve_user_name",
+                new=AsyncMock(return_value="testuser"),
+            ),
+            patch.object(
+                adapter,
+                "_fetch_thread_context",
+                new=AsyncMock(return_value=""),
+            ),
+            patch.object(
+                adapter,
+                "_fetch_thread_parent_text",
+                new=AsyncMock(return_value=""),
+            ),
+        ):
+            await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_dm_is_unaffected_by_flat_channel_patterns(self, adapter):
         adapter.config.extra.update(
             {

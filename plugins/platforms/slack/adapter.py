@@ -1352,14 +1352,18 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
-    async def _channel_flat_mode(self, channel_id: str) -> bool:
-        """Return whether a channel should use flat replies and one shared session.
+    async def _channel_matches_flat_patterns(self, channel_id: str) -> bool:
+        """Return whether a channel's NAME matches ``flat_channel_patterns``.
 
-        ``flat_channel_patterns`` override the global ``reply_in_thread``
-        setting for matching channel names. IMs and MPIMs retain the global
-        behavior because their session semantics are configured separately.
+        This is the pattern-match half of :meth:`_channel_flat_mode`, split out
+        because pattern-matched channels get an extra behavior the global
+        ``reply_in_thread: false`` mode does not: they are implicitly
+        free-response (no @-mention required). A channel named after the bot
+        (e.g. ``ghost-*``) is a dedicated surface where every message is for
+        the bot — requiring a mention there defeats the purpose. The global
+        flat mode must NOT imply free-response: it applies to every channel,
+        including shared ones where mention-gating is the safety rail.
         """
-        global_flat = not self.config.extra.get("reply_in_thread", True)
         raw_patterns = self.config.extra.get("flat_channel_patterns", [])
         patterns = (
             [pattern for pattern in raw_patterns if isinstance(pattern, str)]
@@ -1367,12 +1371,12 @@ class SlackAdapter(BasePlatformAdapter):
             else []
         )
         if not channel_id or not patterns:
-            return global_flat
+            return False
 
         # Slack 1:1 IM IDs start with D. Avoid a Web API lookup because
         # patterns are channel-only and must never alter DM behavior.
         if channel_id.startswith("D"):
-            return global_flat
+            return False
 
         if channel_id not in self._channel_name_cache:
             try:
@@ -1386,25 +1390,37 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 # Cache a failed lookup too: one bad channel must not make every
-                # message retry the API, and the global setting is the safe
-                # fallback when a channel name cannot be resolved.
+                # message retry the API, and no-match is the safe fallback when
+                # a channel name cannot be resolved.
                 self._channel_name_cache[channel_id] = ""
                 self._channel_dm_cache[channel_id] = False
                 logger.debug(
                     "[Slack] Could not resolve channel name for flat-reply "
-                    "patterns (%s); using global reply_in_thread setting: %s",
+                    "patterns (%s); treating as non-matching: %s",
                     channel_id,
                     exc,
                 )
-                return global_flat
+                return False
 
         if self._channel_dm_cache.get(channel_id, False):
-            return global_flat
+            return False
 
         channel_name = self._channel_name_cache[channel_id].lower()
-        return global_flat or any(
+        return any(
             fnmatch.fnmatch(channel_name, pattern.lower()) for pattern in patterns
         )
+
+    async def _channel_flat_mode(self, channel_id: str) -> bool:
+        """Return whether a channel should use flat replies and one shared session.
+
+        ``flat_channel_patterns`` override the global ``reply_in_thread``
+        setting for matching channel names. IMs and MPIMs retain the global
+        behavior because their session semantics are configured separately.
+        """
+        global_flat = not self.config.extra.get("reply_in_thread", True)
+        if global_flat:
+            return True
+        return await self._channel_matches_flat_patterns(channel_id)
 
     async def send(
         self,
@@ -2943,6 +2959,14 @@ class SlackAdapter(BasePlatformAdapter):
 
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
+            elif await self._channel_matches_flat_patterns(channel_id):
+                # Channels matching flat_channel_patterns are implicitly
+                # free-response: a channel named after the bot (ghost-*) is a
+                # dedicated surface where every message addresses the bot, so
+                # requiring an @-mention per message defeats its purpose. The
+                # global reply_in_thread=false mode deliberately does NOT get
+                # this exemption (it applies to shared channels too).
+                pass
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:

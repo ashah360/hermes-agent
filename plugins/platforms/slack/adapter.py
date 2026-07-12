@@ -10,6 +10,7 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+import fnmatch
 import json
 import logging
 import os
@@ -446,6 +447,8 @@ class SlackAdapter(BasePlatformAdapter):
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
         self._channel_team: Dict[str, str] = {}  # channel_id → team_id
+        self._channel_name_cache: Dict[str, str] = {}  # channel_id → channel name
+        self._channel_dm_cache: Dict[str, bool] = {}  # channel_id → is IM/MPIM
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -1349,6 +1352,60 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
+    async def _channel_flat_mode(self, channel_id: str) -> bool:
+        """Return whether a channel should use flat replies and one shared session.
+
+        ``flat_channel_patterns`` override the global ``reply_in_thread``
+        setting for matching channel names. IMs and MPIMs retain the global
+        behavior because their session semantics are configured separately.
+        """
+        global_flat = not self.config.extra.get("reply_in_thread", True)
+        raw_patterns = self.config.extra.get("flat_channel_patterns", [])
+        patterns = (
+            [pattern for pattern in raw_patterns if isinstance(pattern, str)]
+            if isinstance(raw_patterns, list)
+            else []
+        )
+        if not channel_id or not patterns:
+            return global_flat
+
+        # Slack 1:1 IM IDs start with D. Avoid a Web API lookup because
+        # patterns are channel-only and must never alter DM behavior.
+        if channel_id.startswith("D"):
+            return global_flat
+
+        if channel_id not in self._channel_name_cache:
+            try:
+                response = await self._get_client(channel_id).conversations_info(
+                    channel=channel_id
+                )
+                channel = response.get("channel", {})
+                self._channel_name_cache[channel_id] = str(channel.get("name") or "")
+                self._channel_dm_cache[channel_id] = bool(
+                    channel.get("is_im") or channel.get("is_mpim")
+                )
+            except Exception as exc:
+                # Cache a failed lookup too: one bad channel must not make every
+                # message retry the API, and the global setting is the safe
+                # fallback when a channel name cannot be resolved.
+                self._channel_name_cache[channel_id] = ""
+                self._channel_dm_cache[channel_id] = False
+                logger.debug(
+                    "[Slack] Could not resolve channel name for flat-reply "
+                    "patterns (%s); using global reply_in_thread setting: %s",
+                    channel_id,
+                    exc,
+                )
+                return global_flat
+
+        if self._channel_dm_cache.get(channel_id, False):
+            return global_flat
+
+        channel_name = self._channel_name_cache[channel_id].lower()
+        return global_flat or any(
+            fnmatch.fnmatch(channel_name, pattern.lower()) for pattern in patterns
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -1379,7 +1436,9 @@ class SlackAdapter(BasePlatformAdapter):
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = await self._resolve_thread_ts(
+                reply_to, metadata, channel_id=chat_id
+            )
             last_result = None
 
             # reply_broadcast: also post thread replies to the main channel.
@@ -1452,7 +1511,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         try:
             formatted = self.format_message(content)
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = await self._resolve_thread_ts(
+                reply_to, metadata, channel_id=chat_id
+            )
             kwargs = {
                 "channel": chat_id,
                 "user": user_id,
@@ -1614,36 +1675,60 @@ class SlackAdapter(BasePlatformAdapter):
                 return
             # reply_in_thread defaults True (legacy: reply in a thread).
             if self.config.extra.get("reply_in_thread", True):
-                logger.warning(
-                    "[Slack] %s: cron_continuable_surface=in_channel is set "
-                    "WITHOUT reply_in_thread=false. A continuable in-channel "
-                    "cron job will deliver flat, but the bot will still reply "
-                    "to your continuation in a thread — so it falls back to a "
-                    "threaded continuation (\u2248 default behaviour), not the "
-                    "flat channel session you asked for. Set "
-                    "platforms.slack.extra.reply_in_thread: false to pair them.",
-                    team_name,
+                raw_patterns = self.config.extra.get("flat_channel_patterns", [])
+                patterns = (
+                    [pattern for pattern in raw_patterns if isinstance(pattern, str)]
+                    if isinstance(raw_patterns, list)
+                    else []
                 )
+                if patterns:
+                    logger.warning(
+                        "[Slack] %s: cron_continuable_surface=in_channel uses "
+                        "flat_channel_patterns=%s while reply_in_thread=true. "
+                        "Matching cron target channels can continue in their flat "
+                        "channel session; non-matching channels still fall back to "
+                        "a threaded continuation. Ensure every target channel name "
+                        "matches a pattern, or set "
+                        "platforms.slack.extra.reply_in_thread: false.",
+                        team_name,
+                        patterns,
+                    )
+                else:
+                    logger.warning(
+                        "[Slack] %s: cron_continuable_surface=in_channel is set "
+                        "WITHOUT reply_in_thread=false. A continuable in-channel "
+                        "cron job will deliver flat, but the bot will still reply "
+                        "to your continuation in a thread — so it falls back to a "
+                        "threaded continuation (\u2248 default behaviour), not the "
+                        "flat channel session you asked for. Set "
+                        "platforms.slack.extra.reply_in_thread: false to pair them.",
+                        team_name,
+                    )
         except Exception:
             pass
 
-    def _resolve_thread_ts(
+    async def _resolve_thread_ts(
         self,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        channel_id: Optional[str] = None,
     ) -> Optional[str]:
         """Resolve the correct thread_ts for a Slack API call.
 
         Prefers metadata thread_id (the thread parent's ts, set by the
         gateway) over reply_to (which may be a child message's ts).
 
-        When ``reply_in_thread`` is ``false`` in the platform extra config,
-        top-level channel messages receive direct channel replies instead of
-        thread replies.  Messages that originate inside an existing thread are
-        always replied to in-thread to preserve conversation context.
+        When the channel's effective mode is flat — either globally through
+        ``reply_in_thread: false`` or through a matching
+        ``flat_channel_patterns`` entry — top-level channel messages receive
+        direct channel replies. Messages that originate inside an existing
+        thread are always replied to in-thread to preserve conversation context.
+        A missing channel ID intentionally uses global behavior only.
         """
-        # When reply_in_thread is disabled (default: True for backward compat),
-        # only thread messages that are already part of an existing thread.
+        # In effective flat mode, only thread messages that are already part of
+        # an existing thread. Patterns deliberately override reply_in_thread for
+        # named channels, keeping this outbound decision aligned with inbound
+        # session keying.
         # For top-level channel messages, the inbound handler sets
         # metadata.thread_id to the message's own ts as a session-keying
         # fallback (see the `thread_ts = event.get("thread_ts") or ts` branch),
@@ -1651,7 +1736,12 @@ class SlackAdapter(BasePlatformAdapter):
         # top-level message. reply_to is the incoming message's own id, so
         # when thread_id == reply_to the "thread" is synthetic and we reply
         # directly in the channel instead.
-        if not self.config.extra.get("reply_in_thread", True):
+        flat_mode = (
+            await self._channel_flat_mode(channel_id)
+            if channel_id is not None
+            else not self.config.extra.get("reply_in_thread", True)
+        )
+        if flat_mode:
             md = metadata or {}
             existing_thread = md.get("thread_id") or md.get("thread_ts")
             if existing_thread and reply_to and existing_thread == reply_to:
@@ -1680,7 +1770,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        thread_ts = await self._resolve_thread_ts(
+            reply_to, metadata, channel_id=chat_id
+        )
         last_exc = None
         for attempt in range(3):
             try:
@@ -1736,7 +1828,9 @@ class SlackAdapter(BasePlatformAdapter):
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return
 
-        thread_ts = self._resolve_thread_ts(None, metadata)
+        thread_ts = await self._resolve_thread_ts(
+            None, metadata, channel_id=chat_id
+        )
 
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
@@ -2176,7 +2270,9 @@ class SlackAdapter(BasePlatformAdapter):
                 response = await client.get(image_url)
                 response.raise_for_status()
 
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = await self._resolve_thread_ts(
+                reply_to, metadata, channel_id=chat_id
+            )
             result = await self._get_client(chat_id).files_upload_v2(
                 channel=chat_id,
                 content=response.content,
@@ -2249,7 +2345,9 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         try:
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            thread_ts = await self._resolve_thread_ts(
+                reply_to, metadata, channel_id=chat_id
+            )
             last_exc = None
             for attempt in range(3):
                 try:
@@ -2307,7 +2405,9 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"File not found: {file_path}")
 
         display_name = file_name or os.path.basename(file_path)
-        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        thread_ts = await self._resolve_thread_ts(
+            reply_to, metadata, channel_id=chat_id
+        )
 
         try:
             last_exc = None
@@ -2787,13 +2887,14 @@ class SlackAdapter(BasePlatformAdapter):
             #
             # Three cases:
             #   (a) genuine thread reply   → scope session per thread
-            #   (b) top-level, reply_in_thread=true (the default)  →
+            #   (b) top-level, effective threaded mode (the default)  →
             #       legacy behaviour: each top-level message becomes its
             #       own thread, so the UX still "replies in a thread"
             #       and sessions are keyed per thread root
-            #   (c) top-level, reply_in_thread=false → scope one session
+            #   (c) top-level, effective flat mode → scope one session
             #       across the whole channel so context accumulates across
-            #       messages (#15421 bug 1)
+            #       messages (#15421 bug 1). A matching channel-name pattern
+            #       intentionally overrides the global reply_in_thread value.
             event_thread_ts_raw = event.get("thread_ts")
             # Align with ``is_thread_reply`` below — a ``thread_ts ==
             # ts`` payload (some thread-root shapes) is not a real reply
@@ -2803,17 +2904,16 @@ class SlackAdapter(BasePlatformAdapter):
             # variants (Copilot on #15464).
             if event_thread_ts_raw and event_thread_ts_raw != ts:
                 thread_ts = event_thread_ts_raw
-            elif self.config.extra.get("reply_in_thread", True):
+            elif not await self._channel_flat_mode(channel_id):
                 # Legacy default: treat ts as a synthetic thread root so
                 # this top-level message gets its own session.
                 thread_ts = ts
             else:
-                # reply_in_thread=false: no thread key → session manager
-                # groups by (platform, channel_id, None) and the channel
-                # shares one conversation.  reply_to_message_id at the
-                # outbound side is already gated on ``thread_ts != ts``
-                # so None here produces a non-threaded reply without
-                # further changes.
+                # Effective flat mode: no thread key → session manager groups
+                # by (platform, channel_id, None) and the channel shares one
+                # conversation. reply_to_message_id at the outbound side is
+                # already gated on ``thread_ts != ts`` so None here produces
+                # a non-threaded reply without further changes.
                 thread_ts = None
 
         # In channels, respond if:
@@ -3254,7 +3354,9 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            thread_ts = self._resolve_thread_ts(None, metadata)
+            thread_ts = await self._resolve_thread_ts(
+                None, metadata, channel_id=chat_id
+            )
 
             # Slack hard-caps a section block's text at 3000 chars; an
             # oversized block fails the whole send with ``invalid_blocks``
@@ -3341,7 +3443,9 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            thread_ts = self._resolve_thread_ts(None, metadata)
+            thread_ts = await self._resolve_thread_ts(
+                None, metadata, channel_id=chat_id
+            )
             # Same 3000-char section-block cap as send_exec_approval: budget
             # the body against the rendered title so the wrapper never pushes
             # the block over the limit (overflow → invalid_blocks → no buttons).

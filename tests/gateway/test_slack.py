@@ -3503,6 +3503,309 @@ class TestSendImageSSRFGuards:
 
 
 # ---------------------------------------------------------------------------
+# TestFlatChannelPatterns
+# ---------------------------------------------------------------------------
+
+
+class TestFlatChannelPatterns:
+    """Per-channel flat mode keeps inbound and outbound thread decisions aligned."""
+
+    @staticmethod
+    def _event(
+        channel: str,
+        *,
+        ts: str,
+        text: str = "<@U_BOT> hello",
+        thread_ts: str | None = None,
+        channel_type: str = "channel",
+    ) -> dict:
+        event = {
+            "channel": channel,
+            "channel_type": channel_type,
+            "user": "U_USER",
+            "text": text,
+            "ts": ts,
+            "team": "T_TEAM",
+        }
+        if thread_ts is not None:
+            event["thread_ts"] = thread_ts
+        return event
+
+    @staticmethod
+    async def _handle(adapter, event):
+        with (
+            patch.object(
+                adapter,
+                "_resolve_user_name",
+                new=AsyncMock(return_value="testuser"),
+            ),
+            patch.object(
+                adapter,
+                "_fetch_thread_context",
+                new=AsyncMock(return_value=""),
+            ),
+            patch.object(
+                adapter,
+                "_fetch_thread_parent_text",
+                new=AsyncMock(return_value=""),
+            ),
+        ):
+            await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_awaited_once()
+        return adapter.handle_message.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_matching_channel_is_flat_inbound_and_outbound(self, adapter):
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["ghost-*"],
+            }
+        )
+        team_client = AsyncMock()
+        team_client.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "ghost-foo"}}
+        )
+        team_client.chat_postMessage = AsyncMock(return_value={"ts": "reply.1"})
+        adapter._team_clients["T_TEAM"] = team_client
+
+        incoming_ts = "1700000000.000001"
+        message = await self._handle(
+            adapter,
+            self._event("C_GHOST", ts=incoming_ts),
+        )
+
+        assert message.source.thread_id is None
+        assert message.reply_to_message_id is None
+
+        result = await adapter.send(
+            chat_id="C_GHOST",
+            content="flat reply",
+            reply_to=incoming_ts,
+            metadata={"thread_id": message.source.thread_id},
+        )
+
+        assert result.success
+        assert "thread_ts" not in team_client.chat_postMessage.await_args.kwargs
+        team_client.conversations_info.assert_awaited_once_with(channel="C_GHOST")
+
+    @pytest.mark.asyncio
+    async def test_non_matching_channel_keeps_global_threaded_mode(self, adapter):
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["ghost-*"],
+            }
+        )
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "general"}}
+        )
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "reply.2"}
+        )
+
+        incoming_ts = "1700000000.000002"
+        message = await self._handle(
+            adapter,
+            self._event("C_GENERAL", ts=incoming_ts),
+        )
+
+        assert message.source.thread_id == incoming_ts
+
+        await adapter.send(
+            chat_id="C_GENERAL",
+            content="threaded reply",
+            reply_to=incoming_ts,
+            metadata={"thread_id": message.source.thread_id},
+        )
+
+        assert (
+            adapter._app.client.chat_postMessage.await_args.kwargs["thread_ts"]
+            == incoming_ts
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuine_thread_reply_stays_threaded_in_flat_channel(self, adapter):
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["ghost-*"],
+            }
+        )
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "ghost-foo"}}
+        )
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "reply.3"}
+        )
+
+        thread_root = "1700000000.000003"
+        message_ts = "1700000000.000004"
+        message = await self._handle(
+            adapter,
+            self._event(
+                "C_GHOST",
+                ts=message_ts,
+                thread_ts=thread_root,
+            ),
+        )
+
+        assert message.source.thread_id == thread_root
+
+        await adapter.send(
+            chat_id="C_GHOST",
+            content="thread reply",
+            reply_to=message_ts,
+            metadata={"thread_id": message.source.thread_id},
+        )
+
+        assert (
+            adapter._app.client.chat_postMessage.await_args.kwargs["thread_ts"]
+            == thread_root
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_patterns_preserve_legacy_behavior_without_lookup(self, adapter):
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": [],
+            }
+        )
+        adapter._app.client.conversations_info = AsyncMock()
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "reply.4"}
+        )
+
+        incoming_ts = "1700000000.000005"
+        message = await self._handle(
+            adapter,
+            self._event("C_GENERAL", ts=incoming_ts),
+        )
+        await adapter.send(
+            chat_id="C_GENERAL",
+            content="legacy reply",
+            reply_to=incoming_ts,
+            metadata={"thread_id": message.source.thread_id},
+        )
+
+        assert message.source.thread_id == incoming_ts
+        assert (
+            adapter._app.client.chat_postMessage.await_args.kwargs["thread_ts"]
+            == incoming_ts
+        )
+        adapter._app.client.conversations_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_channel_lookup_failure_falls_back_to_global_mode(self, adapter):
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["ghost-*"],
+            }
+        )
+        adapter._app.client.conversations_info = AsyncMock(
+            side_effect=RuntimeError("Slack unavailable")
+        )
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "reply.5"}
+        )
+
+        incoming_ts = "1700000000.000006"
+        message = await self._handle(
+            adapter,
+            self._event("C_UNKNOWN", ts=incoming_ts),
+        )
+        await adapter.send(
+            chat_id="C_UNKNOWN",
+            content="fallback reply",
+            reply_to=incoming_ts,
+            metadata={"thread_id": message.source.thread_id},
+        )
+
+        assert message.source.thread_id == incoming_ts
+        assert (
+            adapter._app.client.chat_postMessage.await_args.kwargs["thread_ts"]
+            == incoming_ts
+        )
+        adapter._app.client.conversations_info.assert_awaited_once_with(
+            channel="C_UNKNOWN"
+        )
+
+    @pytest.mark.asyncio
+    async def test_multiple_patterns_match_case_insensitively_and_cache_name(
+        self, adapter
+    ):
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["support-*", "ghost-*"],
+            }
+        )
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "Ghost-ABC"}}
+        )
+
+        assert await adapter._channel_flat_mode("C_CASE") is True
+        assert await adapter._channel_flat_mode("C_CASE") is True
+        adapter._app.client.conversations_info.assert_awaited_once_with(
+            channel="C_CASE"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dm_is_unaffected_by_flat_channel_patterns(self, adapter):
+        adapter.config.extra.update(
+            {
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["*"],
+            }
+        )
+        adapter._app.client.conversations_info = AsyncMock()
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "reply.6"}
+        )
+
+        incoming_ts = "1700000000.000007"
+        message = await self._handle(
+            adapter,
+            self._event(
+                "D_USER",
+                ts=incoming_ts,
+                text="hello",
+                channel_type="im",
+            ),
+        )
+        await adapter.send(
+            chat_id="D_USER",
+            content="dm reply",
+            reply_to=incoming_ts,
+            metadata={"thread_id": message.source.thread_id},
+        )
+
+        assert message.source.thread_id == incoming_ts
+        assert (
+            adapter._app.client.chat_postMessage.await_args.kwargs["thread_ts"]
+            == incoming_ts
+        )
+        adapter._app.client.conversations_info.assert_not_awaited()
+
+    def test_in_channel_warning_mentions_configured_patterns(self, adapter, caplog):
+        adapter.config.extra.update(
+            {
+                "cron_continuable_surface": "in_channel",
+                "reply_in_thread": True,
+                "flat_channel_patterns": ["ghost-*"],
+            }
+        )
+
+        with caplog.at_level("WARNING"):
+            adapter._warn_if_inchannel_without_flat_reply("Acme")
+
+        assert "flat_channel_patterns=['ghost-*']" in caplog.text
+        assert "Matching cron target channels" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # TestProgressMessageThread
 # ---------------------------------------------------------------------------
 

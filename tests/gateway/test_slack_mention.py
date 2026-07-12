@@ -8,6 +8,8 @@ import sys
 import inspect
 from unittest.mock import MagicMock
 
+import pytest
+
 from gateway.config import Platform, PlatformConfig
 
 
@@ -563,7 +565,8 @@ def test_explicit_platforms_slack_enabled_false_wins_over_env_token(monkeypatch,
     assert "_enabled_explicit" not in slack_config.extra
 
 
-def test_config_bridges_slack_reply_in_thread(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_config_bridges_slack_reply_in_thread(monkeypatch, tmp_path):
     from gateway.config import load_gateway_config
 
     hermes_home = tmp_path / ".hermes"
@@ -584,23 +587,31 @@ def test_config_bridges_slack_reply_in_thread(monkeypatch, tmp_path):
     assert slack_config.extra.get("reply_in_thread") is False
 
     adapter = SlackAdapter(slack_config)
-    assert adapter._resolve_thread_ts(reply_to="171.000", metadata={}) is None
+    assert (
+        await adapter._resolve_thread_ts(reply_to="171.000", metadata={}) is None
+    )
 
     # Top-level channel messages arrive with metadata.thread_id == reply_to
     # because the inbound handler uses event.ts as a session-keying fallback.
     # Those must be treated as non-threaded so reply_in_thread=false takes
     # effect in channels, not just DMs.
-    assert adapter._resolve_thread_ts(
-        reply_to="171.000",
-        metadata={"thread_id": "171.000"},
-    ) is None
+    assert (
+        await adapter._resolve_thread_ts(
+            reply_to="171.000",
+            metadata={"thread_id": "171.000"},
+        )
+        is None
+    )
 
     # Real thread replies (reply_to differs from thread parent) must still
     # resolve to the parent thread so conversation context is preserved.
-    assert adapter._resolve_thread_ts(
-        reply_to="171.500",
-        metadata={"thread_id": "171.000"},
-    ) == "171.000"
+    assert (
+        await adapter._resolve_thread_ts(
+            reply_to="171.500",
+            metadata={"thread_id": "171.000"},
+        )
+        == "171.000"
+    )
 
 
 def test_config_bridges_slack_cron_continuable_surface_toplevel(monkeypatch, tmp_path):

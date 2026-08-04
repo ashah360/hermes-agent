@@ -1523,7 +1523,7 @@ class TestBuildAnthropicKwargs:
     def test_fast_mode_oauth_default_omits_context_1m_beta(self):
         """Default OAuth fast-mode avoids context-1m for subscriptions without it."""
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-6",
+            model="claude-opus-5",
             messages=[{"role": "user", "content": "Hi"}],
             tools=None,
             max_tokens=4096,
@@ -1540,7 +1540,7 @@ class TestBuildAnthropicKwargs:
         """drop_context_1m_beta=True strips context-1m from fast-mode
         extra_headers while preserving every other OAuth + fast-mode beta."""
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-6",
+            model="claude-opus-5",
             messages=[{"role": "user", "content": "Hi"}],
             tools=None,
             max_tokens=4096,
@@ -1660,20 +1660,17 @@ class TestBuildAnthropicKwargs:
         assert _forbids_sampling_params("claude-sonnet-4-5") is False
 
     def test_supports_fast_mode_predicate(self):
-        """Fast mode is Opus 4.6 only — Opus 4.7 and others must be excluded.
-
-        For Opus 4.8 the fast variant is a separate model ID
-        (anthropic/claude-opus-4.8-fast) routed through the normal model
-        field, NOT via the ``speed: "fast"`` request parameter. So
-        ``_supports_fast_mode`` (which gates the parameter) must stay
-        False for both opus-4-8 and opus-4-8-fast.
-        """
+        """Fast mode is limited to the exact current Anthropic model IDs."""
         from agent.anthropic_adapter import _supports_fast_mode
-        assert _supports_fast_mode("claude-opus-4-6") is True
-        assert _supports_fast_mode("anthropic/claude-opus-4-6") is True
+        assert _supports_fast_mode("claude-opus-5") is True
+        assert _supports_fast_mode("anthropic/claude-opus-5") is True
+        assert _supports_fast_mode("claude-opus-4-8") is True
+        assert _supports_fast_mode("anthropic/claude-opus-4-8") is True
         assert _supports_fast_mode("claude-opus-4-7") is False
-        assert _supports_fast_mode("claude-opus-4-8") is False
+        assert _supports_fast_mode("claude-opus-4-6") is False
         assert _supports_fast_mode("claude-opus-4-8-fast") is False
+        assert _supports_fast_mode("claude-opus-5-preview") is False
+        assert _supports_fast_mode("claude-fable-5") is False
         assert _supports_fast_mode("claude-sonnet-4-6") is False
         assert _supports_fast_mode("claude-haiku-4-5") is False
         assert _supports_fast_mode("") is False
@@ -1793,18 +1790,19 @@ class TestBuildAnthropicKwargs:
         beta_header = (kwargs.get("extra_headers") or {}).get("anthropic-beta", "")
         assert "fast-mode-2026-02-01" not in beta_header
 
-    def test_fast_mode_still_applied_on_opus_46(self):
-        """Regression guard — fast mode must still work on Opus 4.6."""
-        kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-6",
-            messages=[{"role": "user", "content": "hi"}],
-            tools=None,
-            max_tokens=1024,
-            reasoning_config=None,
-            fast_mode=True,
-        )
-        assert kwargs.get("extra_body", {}).get("speed") == "fast"
-        assert "fast-mode-2026-02-01" in kwargs["extra_headers"]["anthropic-beta"]
+    def test_fast_mode_injected_for_opus5_and_opus48(self):
+        for model in ("claude-opus-5", "anthropic/claude-opus-4-8"):
+            kwargs = build_anthropic_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                tools=None,
+                max_tokens=1024,
+                reasoning_config=None,
+                fast_mode=True,
+            )
+            assert kwargs["extra_body"]["speed"] == "fast"
+            beta_header = kwargs["extra_headers"]["anthropic-beta"]
+            assert "fast-mode-2026-02-01" in beta_header
 
     def test_reasoning_disabled(self):
         kwargs = build_anthropic_kwargs(

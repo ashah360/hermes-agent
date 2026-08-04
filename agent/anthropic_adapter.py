@@ -118,7 +118,7 @@ def _is_claude_model(model: str | None) -> bool:
     return "claude" in (model or "").lower()
 
 
-_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
+_FAST_MODE_SUPPORTED_SUBSTRINGS = ("claude-opus-5", "claude-opus-4-8")
 
 # ── Max output token limits per Anthropic model ───────────────────────
 # Source: Anthropic docs + Cline model catalog.  Anthropic's API requires
@@ -301,12 +301,12 @@ def _forbids_sampling_params(model: str) -> bool:
 def _supports_fast_mode(model: str) -> bool:
     """Return True for models that support Anthropic Fast Mode (speed=fast).
 
-    Per Anthropic docs, fast mode is currently supported on Opus 4.6 only.
-    Sending ``speed: "fast"`` to any other Claude model (including Opus 4.7)
-    returns HTTP 400. This guard prevents silently 400'ing when stale config
-    or older callers leave fast mode enabled across a model upgrade.
+    Per Anthropic docs, fast mode is currently supported on Opus 5 and Opus
+    4.8. Opus 4.7 rejects ``speed: "fast"`` and Opus 4.6 now falls back to
+    standard speed, so neither older model is advertised as fast-capable.
     """
-    return any(v in model for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
+    raw = model.lower().split("/", 1)[-1].split(":", 1)[0]
+    return raw in _FAST_MODE_SUPPORTED_SUBSTRINGS
 
 
 # Beta headers for enhanced features that are safe on ordinary/native Anthropic
@@ -2809,10 +2809,10 @@ def build_anthropic_kwargs(
         for _sampling_key in ("temperature", "top_p", "top_k"):
             kwargs.pop(_sampling_key, None)
 
-    # ── Fast mode (Opus 4.6 only) ────────────────────────────────────
+    # ── Fast mode (Opus 5 and Opus 4.8) ──────────────────────────────
     # Adds extra_body.speed="fast" + the fast-mode beta header for ~2.5x
-    # output speed. Per Anthropic docs, fast mode is only supported on
-    # Opus 4.6 — Opus 4.7 and other models 400 on the speed parameter.
+    # output speed. Unsupported models are gated above so the native API never
+    # receives a speed parameter it would reject or silently downgrade.
     # Only for native Anthropic endpoints — third-party providers would
     # reject the unknown beta header and speed parameter.
     if (

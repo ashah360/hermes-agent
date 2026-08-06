@@ -192,6 +192,98 @@ def test_clear_removes_token_and_stale_temps(
     rc.clear_sidecar_token()
 
 
+def test_clear_is_path_bound(
+    xdg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing an exact path removes only that token, regardless of the
+    ambient profile scope at clear time."""
+    _default_home(monkeypatch)
+    primary = rc.write_sidecar_token("tok-primary")
+    root = _get_platform_default_hermes_home()
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "secondary"))
+    secondary = rc.write_sidecar_token("tok-secondary")
+    assert primary != secondary
+    # Ambient scope flips back to primary before the clear — the exact
+    # secondary path must still be the one removed.
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    rc.clear_sidecar_token(secondary)
+    assert primary.read_text(encoding="utf-8") == "tok-primary"
+    assert not secondary.exists()
+
+
+# ---------------------------------------------------------------------------
+# Symlink escapes — the writer must never follow a symlinked component under
+# the runtime root, and clear must never delete through one.
+
+
+@pytest.mark.skipif(not _POSIX, reason="symlink tests are POSIX-only")
+def test_write_refuses_symlinked_hermes_dir(
+    xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _default_home(monkeypatch)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "photon-sidecar.token"
+    sentinel.write_text("sentinel", encoding="utf-8")
+    (xdg / "hermes").symlink_to(outside)
+    with pytest.raises((OSError, RuntimeError)):
+        rc.write_sidecar_token("tok-escape-1")
+    # Nothing may land outside the runtime root — not the token, not temps.
+    assert sentinel.read_text(encoding="utf-8") == "sentinel"
+    assert [p.name for p in outside.iterdir()] == ["photon-sidecar.token"]
+
+
+@pytest.mark.skipif(not _POSIX, reason="symlink tests are POSIX-only")
+def test_write_refuses_symlinked_profile_component(
+    xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _get_platform_default_hermes_home()
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "coder"))
+    outside = tmp_path / "outside-profiles"
+    outside.mkdir()
+    hermes_dir = xdg / "hermes"
+    hermes_dir.mkdir(mode=0o700)
+    (hermes_dir / "profiles").symlink_to(outside)
+    with pytest.raises((OSError, RuntimeError)):
+        rc.write_sidecar_token("tok-escape-2")
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(not _POSIX, reason="symlink tests are POSIX-only")
+def test_write_refuses_symlinked_token_leaf(
+    xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _default_home(monkeypatch)
+    outside_file = tmp_path / "outside-token"
+    outside_file.write_text("outside", encoding="utf-8")
+    hermes_dir = xdg / "hermes"
+    hermes_dir.mkdir(mode=0o700)
+    (hermes_dir / "photon-sidecar.token").symlink_to(outside_file)
+    with pytest.raises((OSError, RuntimeError)):
+        rc.write_sidecar_token("tok-escape-3")
+    assert outside_file.read_text(encoding="utf-8") == "outside"
+
+
+@pytest.mark.skipif(not _POSIX, reason="symlink tests are POSIX-only")
+def test_clear_does_not_follow_symlinked_dirs(
+    xdg: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _default_home(monkeypatch)
+    outside = tmp_path / "outside-clear"
+    outside.mkdir()
+    victim = outside / "photon-sidecar.token"
+    victim.write_text("victim", encoding="utf-8")
+    stale_temp = outside / (rc._TMP_PREFIX + "victim2")
+    stale_temp.write_text("victim2", encoding="utf-8")
+    (xdg / "hermes").symlink_to(outside)
+    rc.clear_sidecar_token()  # ambient path traverses the symlink — refuse
+    assert victim.read_text(encoding="utf-8") == "victim"
+    assert stale_temp.read_text(encoding="utf-8") == "victim2"
+    # Path-bound clear through the same symlinked parent must refuse too.
+    rc.clear_sidecar_token(xdg / "hermes" / "photon-sidecar.token")
+    assert victim.read_text(encoding="utf-8") == "victim"
+
+
 # ---------------------------------------------------------------------------
 # Adapter wiring — token materialized on sidecar readiness, cleared on stop.
 
@@ -328,6 +420,79 @@ async def test_failed_sidecar_start_writes_no_token_file(
     with pytest.raises(RuntimeError):
         await adapter._start_sidecar()
     assert not rc.sidecar_token_path().exists()
+
+
+@pytest.mark.asyncio
+async def test_stop_clears_exact_profile_token_despite_ambient_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The adapter must clear the exact file it wrote — not whatever the
+    ambient profile scope resolves to at disconnect time."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    root = _get_platform_default_hermes_home()
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "secondary"))
+
+    adapter = _make_adapter(monkeypatch)
+
+    async def _no_reap() -> None:
+        pass
+
+    monkeypatch.setattr(adapter, "_reap_stale_sidecar", _no_reap)
+    _stub_spawn(monkeypatch, tmp_path, healthy=True)
+
+    await adapter._start_sidecar()
+    secondary = (
+        runtime / "hermes" / "profiles" / "secondary" / "photon-sidecar.token"
+    )
+    assert secondary.read_text(encoding="utf-8") == adapter._sidecar_token
+
+    # Ambient scope flips to the primary profile before disconnect, where a
+    # primary gateway's token is live.
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    primary = rc.write_sidecar_token("tok-primary-gateway")
+
+    await adapter._stop_sidecar()
+    # The primary token must survive; the secondary token must be gone.
+    assert primary.read_text(encoding="utf-8") == "tok-primary-gateway"
+    assert not secondary.exists()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_after_scope_change_rotates_stale_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A re-start under a different ambient scope must clean up the token
+    the previous start materialized — no stale credential left behind."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    root = _get_platform_default_hermes_home()
+
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "alpha"))
+    adapter = _make_adapter(monkeypatch)
+
+    async def _no_reap() -> None:
+        pass
+
+    monkeypatch.setattr(adapter, "_reap_stale_sidecar", _no_reap)
+    _stub_spawn(monkeypatch, tmp_path, healthy=True)
+
+    await adapter._start_sidecar()
+    alpha = runtime / "hermes" / "profiles" / "alpha" / "photon-sidecar.token"
+    assert alpha.exists()
+
+    # Reconnect lands under a different ambient scope.
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "beta"))
+    await adapter._start_sidecar()
+    beta = runtime / "hermes" / "profiles" / "beta" / "photon-sidecar.token"
+    assert beta.read_text(encoding="utf-8") == adapter._sidecar_token
+    assert not alpha.exists(), "stale token from the previous scope leaked"
+
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    await adapter._stop_sidecar()
+    assert not beta.exists()
 
 
 @pytest.mark.asyncio

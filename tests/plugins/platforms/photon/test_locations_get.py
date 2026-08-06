@@ -201,6 +201,33 @@ def test_locations_get_not_sharing_returns_null(sidecar: SidecarHarness) -> None
     assert body["location"] is None
 
 
+def test_locations_get_generic_not_found_is_upstream_error(
+    sidecar: SidecarHarness,
+) -> None:
+    """Only the exact ``sharedFriendLocationNotFound`` code means "not
+    sharing". Any other NotFoundError (or one with no code) is an upstream
+    failure — mapping it to a null location would fabricate an answer."""
+    cases = [
+        ("+15551110004", {"name": "NotFoundError", "code": "chatNotFound"}),
+        ("+15551110005", {"name": "NotFoundError"}),  # code missing
+    ]
+    for address, error in cases:
+        sidecar.set_get_response(
+            address,
+            {"error": {**error, "message": f"not found: {address}"}},
+        )
+        resp = sidecar.post("/locations/get", json_body={"address": address})
+        assert resp.status_code == 502, (address, error)
+        body = resp.json()
+        assert body["ok"] is False
+        assert body.get("location") is None
+        assert address not in json.dumps(body)
+    time.sleep(0.3)
+    log_text = sidecar.output()
+    for address, _ in cases:
+        assert address not in log_text
+
+
 def test_locations_get_upstream_error_is_generic_and_leak_free(
     sidecar: SidecarHarness,
 ) -> None:

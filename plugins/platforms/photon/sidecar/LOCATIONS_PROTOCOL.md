@@ -49,11 +49,13 @@ Fetch the latest shared-location snapshot for one friend.
   strings (`Date#toISOString`). Coordinates are absent while the device is
   still acquiring a fix — the sidecar never fabricates them.
 - `200 {"ok": true, "location": null}` — the address is **not currently
-  sharing** a location (SDK `NotFoundError` /
-  `code == "sharedFriendLocationNotFound"`). Not an error.
+  sharing** a location. Mapped ONLY from the exact SDK error code
+  `sharedFriendLocationNotFound`. Not an error.
 - `502 {"ok": false, "error": "upstream locations error"}` — any other SDK
-  failure. The response and the sidecar log carry only the error class/code,
-  never the handle or the SDK message text.
+  failure, **including a generic `NotFoundError` with a different or missing
+  code** (`chatNotFound`, `addressNotFound`, …) — mapping those to `null`
+  would fabricate a "not sharing" answer. The response and the sidecar log
+  carry only the error class/code, never the handle or the SDK message text.
 - `503 {"ok": false, "error": "locations unavailable"}` — the Spectrum app
   has no remote iMessage client (e.g. local mode).
 
@@ -136,6 +138,21 @@ Properties:
 - Writes are atomic (`os.replace` of a same-directory temp file) so a
   reader never observes a partial token; rotation on adapter restart is a
   single atomic swap. Stop removes the file and any stale temp files.
+- **Symlink-safe.** The runtime root is canonicalized once; every component
+  below it is traversed with descriptor-relative `O_NOFOLLOW` opens on
+  POSIX, must be a real directory owned by the current user, and the opened
+  chain is verified against the canonical path before the token is swapped
+  in. A symlinked `hermes`/`profiles`/profile/leaf component aborts the
+  write; nothing is ever written outside the approved runtime root. Windows
+  falls back to explicit per-component symlink rejection. Cleanup never
+  follows symlinks either.
+- **Path-bound cleanup.** The adapter records the exact path each write
+  returned and clears that path on stop/reconnect — never the path the
+  ambient profile scope resolves to at clear time. A secondary-profile
+  sidecar stopping while the primary scope is ambient removes its own
+  token and leaves the primary's untouched; a reconnect that lands under a
+  different scope rotates the previously materialized token out. An adapter
+  that never wrote a token clears nothing.
 - The token value is never logged.
 
 ## Design notes / protocol assumptions

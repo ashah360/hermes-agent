@@ -21,7 +21,7 @@ def test_sidecar_healthz_reports_stream_health() -> None:
     """Local process health must include upstream stream health."""
     index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
     assert "function streamHealthSnapshot()" in index
-    assert 'return ok(res, { stream: streamHealthSnapshot() });' in index
+    assert "stream: streamHealthSnapshot()," in index
     assert "STREAM_INTERRUPTED_DEGRADE_COUNT" in index
     assert "process.exit(75);" in index
 

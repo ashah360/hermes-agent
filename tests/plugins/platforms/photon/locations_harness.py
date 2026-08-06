@@ -415,6 +415,13 @@ class SidecarHarness:
         token: Optional[str] = TOKEN,
         read_timeout: float = 10.0,
     ) -> Iterator[httpx.Response]:
+        """Open a /locations/watch NDJSON stream.
+
+        CAUTION: bind ``resp.iter_lines()`` to a variable that lives as long
+        as the connection should. httpx ties response finalization to that
+        generator — dropping it lets GC close the response, and the sidecar
+        (correctly) treats that as a consumer disconnect.
+        """
         with httpx.Client(
             timeout=httpx.Timeout(5.0, read=read_timeout)
         ) as client:

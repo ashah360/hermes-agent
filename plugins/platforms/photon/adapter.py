@@ -1014,6 +1014,7 @@ class PhotonAdapter(BasePlatformAdapter):
                         headers={"X-Hermes-Sidecar-Token": self._sidecar_token},
                     )
                     if resp.status_code == 200:
+                        self._write_runtime_token_file()
                         return
                 except httpx.RequestError as e:
                     last_err = e
@@ -1021,6 +1022,33 @@ class PhotonAdapter(BasePlatformAdapter):
         raise RuntimeError(
             f"Photon sidecar did not become ready within 15s: {last_err}"
         )
+
+    # -- Scoped credential handoff (S8) --------------------------------------
+    #
+    # Local consumers of the sidecar's read-only location protocol (Hermes
+    # Presence) read the sidecar token from a dedicated runtime credential
+    # file instead of parsing ~/.hermes/.env. Written only once the sidecar
+    # passes its readiness check; removed when the sidecar stops. Both steps
+    # are best-effort — a credential-file failure must never break messaging.
+
+    def _write_runtime_token_file(self) -> None:
+        try:
+            from .runtime_credentials import write_sidecar_token
+
+            write_sidecar_token(self._sidecar_token)
+        except Exception as exc:
+            # Never include the token itself in this message.
+            logger.warning(
+                "[photon] failed to write sidecar runtime token file: %s", exc
+            )
+
+    def _clear_runtime_token_file(self) -> None:
+        try:
+            from .runtime_credentials import clear_sidecar_token
+
+            clear_sidecar_token()
+        except Exception:
+            pass
 
     async def _supervise_sidecar(self, proc: subprocess.Popen) -> None:
         """Pump the sidecar's stdout/stderr into our logger."""
@@ -1091,6 +1119,7 @@ class PhotonAdapter(BasePlatformAdapter):
                     proc.kill()
         finally:
             self._sidecar_proc = None
+            self._clear_runtime_token_file()
             if self._sidecar_supervisor_task is not None:
                 self._sidecar_supervisor_task.cancel()
                 self._sidecar_supervisor_task = None

@@ -70,10 +70,16 @@ def test_watch_two_consumers_independent_epochs_and_sequences(
 
 def test_watch_watcher_cap(sidecar: SidecarHarness) -> None:
     with contextlib.ExitStack() as stack:
+        # NB: every iter_lines() generator must be retained for the stack's
+        # lifetime. httpx ties response finalization to the iterator — a
+        # dropped generator is GC-finalized, which CLOSES its response and
+        # the sidecar (correctly) reaps that watcher as disconnected.
+        line_iters = []
         for i in range(MAX_WATCHERS):
             resp = stack.enter_context(sidecar.watch(f"+1555333000{i}"))
-            lines = resp.iter_lines()
-            assert read_frame(lines)["type"] == "epoch"
+            line_iters.append(resp.iter_lines())
+            assert read_frame(line_iters[-1])["type"] == "epoch"
+        sidecar.wait_active_watchers(MAX_WATCHERS)
         overflow = sidecar.post(
             "/locations/watch", json_body={"address": "+15553330999"}
         )
@@ -82,7 +88,8 @@ def test_watch_watcher_cap(sidecar: SidecarHarness) -> None:
     # Slots must be released once the consumers disconnect.
     sidecar.wait_active_watchers(0)
     with sidecar.watch("+15553331000") as resp:
-        assert read_frame(resp.iter_lines())["type"] == "epoch"
+        lines = resp.iter_lines()
+        assert read_frame(lines)["type"] == "epoch"
     sidecar.wait_active_watchers(0)
 
 

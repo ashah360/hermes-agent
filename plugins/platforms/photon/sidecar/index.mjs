@@ -33,6 +33,10 @@
 //              "reactionId": "..." | null (restart-recovery fallback)}
 //   - POST /typing      -> {"ok": true}
 //       body: {"spaceId": "...", "state": "start" | "stop"}
+//   - POST /locations/get   -> {"ok": true, "location": {...} | null}
+//       body: {"address": "<E.164 phone or email>"}
+//   - POST /locations/watch -> 200 NDJSON stream (epoch/update/heartbeat
+//       frames; see LOCATIONS_PROTOCOL.md). body: {"address": "..."}
 //   - POST /shutdown    -> {"ok": true}; then process exits
 //
 // On SIGINT/SIGTERM the sidecar calls `app.stop()` (3s graceful) before
@@ -53,11 +57,14 @@
 //                          detection so a dead gateway can't orphan us)
 //   PHOTON_TELEMETRY       enable Spectrum SDK telemetry ("true"/"1"/"on"/"yes";
 //                          default off — toggle with `hermes photon telemetry`)
+//   PHOTON_MAX_LOCATION_WATCHERS  concurrent /locations/watch consumers
+//                          (default 8)
 
 import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import { createLocationsService } from "./locations.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -265,6 +272,10 @@ const app = await Spectrum({
   options: { flattenGroups: true },
   telemetry,
 });
+
+// Read-only friend-location protocol (S8) — served off the SAME Spectrum
+// app; never a second Spectrum process/client. See LOCATIONS_PROTOCOL.md.
+const locationsService = createLocationsService({ app });
 
 // ---------------------------------------------------------------------------
 // Inbound: forward `app.messages` (gRPC stream) to the Python consumer.
@@ -711,12 +722,20 @@ const server = http.createServer(async (req, res) => {
   }
   try {
     if (req.url === "/healthz") {
-      return ok(res, { stream: streamHealthSnapshot() });
+      return ok(res, {
+        stream: streamHealthSnapshot(),
+        locations: locationsService.snapshot(),
+      });
     }
     if (req.url === "/shutdown") {
       ok(res, {});
       setTimeout(() => process.kill(process.pid, "SIGTERM"), 50);
       return;
+    }
+    // Friend-location endpoints own their body reading (stricter cap) and
+    // never throw — routed before the generic readBody.
+    if (req.url === "/locations/get" || req.url === "/locations/watch") {
+      return await locationsService.handleRequest(req, res);
     }
     const body = await readBody(req);
     if (req.url === "/send") {
@@ -863,6 +882,13 @@ async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   console.error(`photon-sidecar: received ${signal}, stopping...`);
+  // Drop live location watchers first so their SDK subscriptions cancel
+  // before app.stop() tears the connection down.
+  try {
+    locationsService.shutdown();
+  } catch {
+    /* best-effort */
+  }
   try {
     await Promise.race([
       app.stop(),

@@ -320,6 +320,10 @@ class PhotonAdapter(BasePlatformAdapter):
 
         # Runtime state
         self._sidecar_proc: Optional[subprocess.Popen] = None
+        # Exact path of the runtime credential file THIS adapter wrote (S8).
+        # Cleanup is bound to this path, never to the ambient profile scope
+        # at disconnect time.
+        self._runtime_token_path: Optional[Path] = None
         self._sidecar_supervisor_task: Optional[asyncio.Task] = None
         self._inbound_task: Optional[asyncio.Task] = None
         self._sidecar_health_task: Optional[asyncio.Task] = None
@@ -1030,12 +1034,27 @@ class PhotonAdapter(BasePlatformAdapter):
     # file instead of parsing ~/.hermes/.env. Written only once the sidecar
     # passes its readiness check; removed when the sidecar stops. Both steps
     # are best-effort — a credential-file failure must never break messaging.
+    #
+    # Cleanup is PATH-BOUND: we record the exact path each write returned and
+    # clear that path later. The ambient profile scope (HERMES_HOME) at
+    # disconnect time may differ from the one at start time — resolving the
+    # path again then would delete another profile's live token and leave
+    # ours stale.
 
     def _write_runtime_token_file(self) -> None:
         try:
-            from .runtime_credentials import write_sidecar_token
+            from .runtime_credentials import (
+                clear_sidecar_token,
+                write_sidecar_token,
+            )
 
-            write_sidecar_token(self._sidecar_token)
+            new_path = write_sidecar_token(self._sidecar_token)
+            stale = self._runtime_token_path
+            if stale is not None and stale != new_path:
+                # Reconnect landed under a different scope — rotate the
+                # previously materialized token out instead of leaking it.
+                clear_sidecar_token(stale)
+            self._runtime_token_path = new_path
         except Exception as exc:
             # Never include the token itself in this message.
             logger.warning(
@@ -1043,10 +1062,16 @@ class PhotonAdapter(BasePlatformAdapter):
             )
 
     def _clear_runtime_token_file(self) -> None:
+        path = self._runtime_token_path
+        self._runtime_token_path = None
+        if path is None:
+            # This adapter never materialized a token — do NOT clear the
+            # ambient scope's file, which may belong to another gateway.
+            return
         try:
             from .runtime_credentials import clear_sidecar_token
 
-            clear_sidecar_token()
+            clear_sidecar_token(path)
         except Exception:
             pass
 

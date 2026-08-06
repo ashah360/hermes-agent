@@ -56,12 +56,12 @@ export function locationsResourceFromApp(app) {
 }
 
 // "Not currently sharing" is a normal outcome, not an error: the SDK throws
-// NotFoundError with code `sharedFriendLocationNotFound`.
+// NotFoundError with the exact code `sharedFriendLocationNotFound`. ONLY
+// that code maps to a null location — a generic NotFoundError (chatNotFound,
+// addressNotFound, a code-less error, ...) is an upstream failure, and
+// mapping it to null would fabricate a "not sharing" answer.
 function isNotSharing(error) {
-  return (
-    error?.code === "sharedFriendLocationNotFound" ||
-    error?.name === "NotFoundError"
-  );
+  return error?.code === "sharedFriendLocationNotFound";
 }
 
 // Log-safe error label: class + canonical code only — never the message,

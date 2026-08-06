@@ -14,6 +14,7 @@ the token never appears in logs.
 """
 from __future__ import annotations
 
+import os
 import stat
 import subprocess
 import sys
@@ -209,6 +210,111 @@ def test_clear_is_path_bound(
     rc.clear_sidecar_token(secondary)
     assert primary.read_text(encoding="utf-8") == "tok-primary"
     assert not secondary.exists()
+
+
+# ---------------------------------------------------------------------------
+# Descriptor ownership — a write failure must never leak (or double-close)
+# the raw temp fd. Before ``os.fdopen`` succeeds the writer owns the fd and
+# must close it exactly once on failure; after ``os.fdopen`` the file object
+# owns it and the writer must not touch it again.
+
+_PROC_FD = Path("/proc/self/fd")
+
+
+def _open_fd_count() -> int:
+    return len(os.listdir(_PROC_FD))
+
+
+@pytest.mark.skipif(
+    not _PROC_FD.exists(), reason="/proc fd accounting is Linux-only"
+)
+def test_posix_writer_closes_fd_when_fdopen_fails(
+    xdg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _default_home(monkeypatch)
+
+    def _boom(fd: int, *args: object, **kwargs: object):
+        raise MemoryError("fdopen fault injection")
+
+    before = _open_fd_count()
+    monkeypatch.setattr(rc.os, "fdopen", _boom)
+    with pytest.raises(MemoryError):
+        rc.write_sidecar_token("tok-fdleak-posix")
+    monkeypatch.setattr(rc.os, "fdopen", os.fdopen)
+    assert _open_fd_count() == before, "raw temp fd leaked"
+    parent = rc.sidecar_token_path().parent
+    assert not rc.sidecar_token_path().exists()
+    assert list(parent.glob(f"{rc._TMP_PREFIX}*")) == []
+
+
+@pytest.mark.skipif(
+    not _PROC_FD.exists(), reason="/proc fd accounting is Linux-only"
+)
+def test_posix_writer_no_double_close_after_fdopen_owns_fd(
+    xdg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failure AFTER ownership transfer: the file object closes the fd; the
+    writer must not close the raw fd a second time."""
+    _default_home(monkeypatch)
+
+    def _boom(fd: int) -> None:
+        raise OSError("fsync fault injection")
+
+    before = _open_fd_count()
+    monkeypatch.setattr(rc.os, "fsync", _boom)
+    with pytest.raises(OSError, match="fsync fault injection"):
+        rc.write_sidecar_token("tok-fdown-posix")
+    monkeypatch.setattr(rc.os, "fsync", os.fsync)
+    assert _open_fd_count() == before
+    parent = rc.sidecar_token_path().parent
+    assert not rc.sidecar_token_path().exists()
+    assert list(parent.glob(f"{rc._TMP_PREFIX}*")) == []
+
+
+@pytest.mark.skipif(
+    not _PROC_FD.exists(), reason="/proc fd accounting is Linux-only"
+)
+def test_fallback_writer_closes_fd_when_fdopen_fails(
+    xdg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _default_home(monkeypatch)
+    monkeypatch.setattr(rc, "_POSIX", False)  # force the fallback writer
+
+    def _boom(fd: int, *args: object, **kwargs: object):
+        raise MemoryError("fdopen fault injection")
+
+    before = _open_fd_count()
+    monkeypatch.setattr(rc.os, "fdopen", _boom)
+    with pytest.raises(MemoryError):
+        rc.write_sidecar_token("tok-fdleak-fallback")
+    monkeypatch.setattr(rc.os, "fdopen", os.fdopen)
+    assert _open_fd_count() == before, "raw temp fd leaked"
+    parent = rc.sidecar_token_path().parent
+    assert not rc.sidecar_token_path().exists()
+    assert list(parent.glob(f"{rc._TMP_PREFIX}*")) == []
+
+
+@pytest.mark.skipif(
+    not _PROC_FD.exists(), reason="/proc fd accounting is Linux-only"
+)
+def test_fallback_writer_no_double_close_after_fdopen_owns_fd(
+    xdg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _default_home(monkeypatch)
+    monkeypatch.setattr(rc, "_POSIX", False)  # force the fallback writer
+
+    def _boom(fd: int) -> None:
+        raise OSError("fsync fault injection")
+
+    before = _open_fd_count()
+    monkeypatch.setattr(rc.os, "fsync", _boom)
+    with pytest.raises(OSError, match="fsync fault injection"):
+        rc.write_sidecar_token("tok-fdown-fallback")
+    monkeypatch.setattr(rc.os, "fsync", os.fsync)
+    assert _open_fd_count() == before
+    parent = rc.sidecar_token_path().parent
+    assert not rc.sidecar_token_path().exists()
+    assert list(parent.glob(f"{rc._TMP_PREFIX}*")) == []
 
 
 # ---------------------------------------------------------------------------

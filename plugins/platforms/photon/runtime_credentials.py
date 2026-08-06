@@ -218,8 +218,15 @@ def _write_posix(anchor: Path, path: Path, token: str) -> None:
             0o600,
             dir_fd=leaf_fd,
         )
+        # Until os.fdopen() succeeds WE own the raw descriptor and must close
+        # it exactly once on failure; once the file object exists it owns the
+        # fd (its close/with handles it) and touching the raw fd again would
+        # risk double-closing a reused descriptor number.
+        raw_fd_owned = True
         try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+            handle = os.fdopen(tmp_fd, "w", encoding="utf-8")
+            raw_fd_owned = False
+            with handle:
                 handle.write(token)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -227,6 +234,11 @@ def _write_posix(anchor: Path, path: Path, token: str) -> None:
                 tmp_name, path.name, src_dir_fd=leaf_fd, dst_dir_fd=leaf_fd
             )
         except BaseException:
+            if raw_fd_owned:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
             try:
                 os.unlink(tmp_name, dir_fd=leaf_fd)
             except OSError:
@@ -264,13 +276,23 @@ def _write_fallback(anchor: Path, path: Path, token: str) -> None:
         _reject_symlink(current)
     _reject_symlink(path)
     fd, tmp_name = tempfile.mkstemp(prefix=_TMP_PREFIX, dir=str(path.parent))
+    # Same ownership contract as the POSIX writer: close the raw fd exactly
+    # once if os.fdopen() fails; never touch it after the file object owns it.
+    raw_fd_owned = True
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        raw_fd_owned = False
+        with handle:
             handle.write(token)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_name, path)
     except BaseException:
+        if raw_fd_owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_name)
         except OSError:

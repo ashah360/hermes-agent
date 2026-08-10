@@ -3943,28 +3943,6 @@ class SlackAdapter(BasePlatformAdapter):
             f"mention of you, even if their name is similar."
         )
 
-    def _build_mention_directed_prompt(self, team_id: str = "") -> str:
-        """Ephemeral per-turn line: routing verified this message summoned the bot.
-
-        The ``<@bot_uid>`` markup is stripped before MessageEvent construction,
-        so without this the identity prompt's "only when it mentions @name"
-        rule makes the model NO_REPLY an explicit summons. Same never-persisted
-        ``channel_prompt`` seam as the identity prompt; appended only when
-        ``is_mentioned``, so unmentioned accepted messages never look directed.
-        """
-        name = (
-            (team_id and self._team_bot_names.get(team_id))
-            or self._bot_display_name
-            or ""
-        ).strip()
-        handle = f'"@{name}"' if name else "you"
-        return (
-            f"The current message explicitly mentioned {handle} and is "
-            f"directed at you (the mention itself may have been removed from "
-            f"the visible message text during processing). Treat this message "
-            f"as addressed to you and respond to it."
-        )
-
     async def _resolve_user_is_bot(
         self, user_id: str, chat_id: str = "", team_id: str = ""
     ) -> bool:
@@ -6257,17 +6235,6 @@ class SlackAdapter(BasePlatformAdapter):
                 if _channel_prompt
                 else _identity_prompt
             )
-        # The <@bot> markup was stripped above, so restate the routing-verified
-        # mention ephemerally (never persisted; prompt caching preserved) —
-        # otherwise the identity prompt's mention rule yields NO_REPLY.
-        if is_mentioned:
-            _mention_directed = self._build_mention_directed_prompt(team_id)
-            if _mention_directed:
-                _channel_prompt = (
-                    f"{_channel_prompt}\n\n{_mention_directed}".strip()
-                    if _channel_prompt
-                    else _mention_directed
-                )
         _auto_skill = resolve_channel_skills(
             self.config.extra,
             channel_id,

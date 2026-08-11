@@ -14,9 +14,11 @@ bug). Two cooperating fixes:
 """
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from gateway.config import PlatformConfig
 
 
 # ---------------------------------------------------------------------------
@@ -156,3 +158,118 @@ def test_identity_prompt_empty_when_name_unknown():
     adapter._bot_display_name = None
     adapter._team_bot_names = {}
     assert adapter._build_identity_prompt(team_id="T1") == ""
+
+
+def test_identity_prompt_does_not_re_gate_directedness():
+    """Adapter routing is the sole authority for whether an event reaches the
+    model. The identity prompt grounds WHO the bot is; it must never instruct
+    the model to re-decide WHETHER a routed message is directed at it — that
+    second mention gate contradicts routed bare thread follow-ups (which by
+    design carry no current-turn @mention) and makes them unstable/silent."""
+    adapter = _make_adapter()
+    adapter._bot_display_name = "TestBot"
+    adapter._team_bot_names = {}
+    prompt = adapter._build_identity_prompt(team_id="T1")
+    assert "only treat a message as directed" not in prompt.lower()
+    # Positive grounding must survive: the handle, and the other-participant
+    # disambiguation.
+    assert "@TestBot" in prompt
+    assert "not a mention of you" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Integration: real _handle_slack_message — routed bare thread follow-ups
+# must not be second-guessed by the composed channel_prompt.
+# (Harness mirrors tests/gateway/test_slack_ignore_other_user_mentions.py.)
+# ---------------------------------------------------------------------------
+
+BOT_USER_ID = "U_BOT_123"
+CHANNEL_ID = "C0AQWDLHY9M"
+
+
+@pytest.fixture
+def wired_adapter():
+    config = PlatformConfig(enabled=True, token="xoxb-fake-token")
+    a = SlackAdapter(config)
+    a._app = MagicMock()
+    a._app.client = AsyncMock()
+    a._bot_user_id = BOT_USER_ID
+    a._bot_display_name = "Hermes"
+    a._running = True
+    a.handle_message = AsyncMock()
+    return a
+
+
+@pytest.fixture(autouse=True)
+def _redirect_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "doc_cache"
+    )
+    # Keep gating driven by config.extra, not ambient env.
+    monkeypatch.delenv("SLACK_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("SLACK_STRICT_MENTION", raising=False)
+
+
+def _event(text, ts, thread_ts=None):
+    event = {
+        "channel": CHANNEL_ID,
+        "channel_type": "channel",
+        "user": "U_HUMAN",
+        "text": text,
+        "ts": ts,
+    }
+    if thread_ts is not None:
+        event["thread_ts"] = thread_ts
+    return event
+
+
+async def _run(adapter, event):
+    with patch.object(
+        adapter, "_resolve_user_name", new=AsyncMock(return_value="human")
+    ), patch.object(
+        adapter, "_fetch_thread_context", new=AsyncMock(return_value=None)
+    ), patch.object(
+        adapter, "_fetch_thread_parent_text", new=AsyncMock(return_value="")
+    ), patch.object(
+        adapter, "_has_active_session_for_thread", return_value=False
+    ):
+        await adapter._handle_slack_message(event)
+
+
+@pytest.mark.asyncio
+async def test_bare_followup_in_mentioned_thread_routes_without_mention_gate(
+    wired_adapter,
+):
+    """Regression: a bare (unmentioned) follow-up in a previously-mentioned
+    thread is routed by the adapter, and the composed channel_prompt must not
+    instruct the model to require a current-turn @mention before treating the
+    message as directed at it."""
+    thread_ts = "1700000000.000100"
+    wired_adapter._mentioned_threads.add(thread_ts)
+
+    await _run(
+        wired_adapter,
+        _event("what about next week?", ts="1700000000.000101", thread_ts=thread_ts),
+    )
+
+    wired_adapter.handle_message.assert_awaited_once()
+    msg_event = wired_adapter.handle_message.await_args.args[0]
+    channel_prompt = msg_event.channel_prompt or ""
+    # Identity grounding survives...
+    assert "@Hermes" in channel_prompt
+    assert "not a mention of you" in channel_prompt
+    # ...but no second mention gate after routing already accepted the event.
+    assert "only treat a message as directed" not in channel_prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_unmentioned_top_level_message_stays_rejected(
+    wired_adapter,
+):
+    """Adapter gates remain the authority: ambient top-level channel chatter
+    with no mention, no mentioned thread, and no active session never reaches
+    the agent."""
+    await _run(wired_adapter, _event("ambient chatter", ts="1700000000.000200"))
+
+    wired_adapter.handle_message.assert_not_awaited()

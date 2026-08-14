@@ -2,6 +2,7 @@
 
 import asyncio
 import concurrent.futures
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -74,11 +75,7 @@ class _RoutingAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "dm"}
 
 
-@pytest.mark.asyncio
-async def test_plugin_context_routes_through_live_gateway_to_existing_session(
-    tmp_path,
-    monkeypatch,
-):
+def _grant_injection(tmp_path, monkeypatch) -> None:
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
@@ -87,6 +84,37 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
         })
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+
+def _plugin_context(manager: PluginManager) -> PluginContext:
+    return PluginContext(
+        PluginManifest(name="notify-plugin", key="notify-plugin", source="user"),
+        manager,
+    )
+
+
+def _live_runner(store, adapter) -> GatewayRunner:
+    """Slim GatewayRunner wired to a real store/adapter on the running loop."""
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._running = True
+    runner._draining = False
+    runner._background_tasks = set()
+    runner._queued_events = {}
+    runner._is_user_authorized = MagicMock(return_value=True)
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_plugin_context_routes_through_live_gateway_to_existing_session(
+    tmp_path,
+    monkeypatch,
+):
+    _grant_injection(tmp_path, monkeypatch)
 
     store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
     source = _entry().origin
@@ -103,23 +131,9 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
     )
     adapter._pending_messages[entry.session_key] = pending_user_event
 
-    runner = object.__new__(GatewayRunner)
-    runner.session_store = store
-    runner.adapters = {Platform.TELEGRAM: adapter}
-    runner._profile_adapters = {}
-    runner._gateway_loop = asyncio.get_running_loop()
-    runner._running = True
-    runner._draining = False
-    runner._background_tasks = set()
-    runner._queued_events = {}
-    runner._is_user_authorized = MagicMock(return_value=True)
-    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
-
+    runner = _live_runner(store, adapter)
     manager = PluginManager()
-    context = PluginContext(
-        PluginManifest(name="notify-plugin", key="notify-plugin", source="user"),
-        manager,
-    )
+    context = _plugin_context(manager)
 
     with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
         runner._install_plugin_message_injector()
@@ -546,17 +560,257 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
         runner._install_plugin_message_injector()
         assert manager.has_gateway_message_injector is True
+        assert manager.has_gateway_confirmed_message_injector is True
 
         runner._clear_plugin_message_injector()
         assert manager.has_gateway_message_injector is False
+        assert manager.has_gateway_confirmed_message_injector is False
 
         runner._install_plugin_message_injector()
 
         newer_owner = MagicMock()
         newer_injector = MagicMock(return_value=True)
+        newer_confirmed = MagicMock(return_value=True)
         manager.set_gateway_message_injector(newer_owner, newer_injector)
+        manager.set_gateway_confirmed_message_injector(newer_owner, newer_confirmed)
         runner._clear_plugin_message_injector()
 
     assert manager.has_gateway_message_injector is True
+    assert manager.has_gateway_confirmed_message_injector is True
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")
+    assert manager.inject_gateway_message_confirmed(value="kept") is True
+    newer_confirmed.assert_called_once_with(value="kept")
+
+
+# -- inject_message_confirmed / confirmed dispatch ----------------------------
+#
+# inject_message returns True once the gateway accepts the request for
+# asynchronous dispatch; inject_message_confirmed blocks the plugin's worker
+# thread (never the gateway loop) until the dispatch actually finishes.
+
+
+@pytest.mark.asyncio
+async def test_confirmed_injection_full_path_reports_adapter_acceptance(
+    tmp_path,
+    monkeypatch,
+):
+    """Worker-thread call through the real runner returns True on acceptance."""
+    _grant_injection(tmp_path, monkeypatch)
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    source = _entry().origin
+    entry = store.get_or_create_session(source)
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+    adapter._pending_messages[entry.session_key] = MessageEvent(
+        text="human follow-up",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+    runner = _live_runner(store, adapter)
+    manager = PluginManager()
+    context = _plugin_context(manager)
+
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+        runner._install_plugin_message_injector()
+
+        accepted = await asyncio.to_thread(
+            context.inject_message_confirmed,
+            "deployment finished",
+            session_key=entry.session_key,
+        )
+
+        assert accepted is True
+        queued = runner._queued_events[entry.session_key][0]
+        assert queued.text == "deployment finished"
+        assert queued.metadata["hermes_plugin_id"] == "notify-plugin"
+
+        runner._clear_plugin_message_injector()
+        assert manager.has_gateway_confirmed_message_injector is False
+
+
+@pytest.mark.asyncio
+async def test_confirmed_injection_false_where_immediate_reports_true(
+    tmp_path,
+    monkeypatch,
+):
+    """Unroutable session: the immediate API reports True, confirmed False."""
+    _grant_injection(tmp_path, monkeypatch)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(None, adapter)  # session lookup resolves to nothing
+    runner._gateway_loop = asyncio.get_running_loop()
+    manager = PluginManager()
+    context = _plugin_context(manager)
+
+    with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+        runner._install_plugin_message_injector()
+
+        assert (
+            context.inject_message(
+                "wake up",
+                session_key="agent:main:telegram:dm:42",
+            )
+            is True
+        )
+        await asyncio.gather(*runner._background_tasks, return_exceptions=True)
+
+        assert (
+            await asyncio.to_thread(
+                context.inject_message_confirmed,
+                "wake up",
+                session_key="agent:main:telegram:dm:42",
+            )
+            is False
+        )
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["auth_denied", "draining", "dispatch_raises"])
+async def test_confirmed_scheduler_reports_dispatch_failure_as_false(failure):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(_entry(), adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    if failure == "auth_denied":
+        runner._is_user_authorized.return_value = False
+    elif failure == "draining":
+        runner._draining = True
+    else:
+        runner._dispatch_plugin_message_injection = AsyncMock(
+            side_effect=RuntimeError("adapter failed")
+        )
+
+    accepted = await asyncio.to_thread(
+        runner._schedule_plugin_message_injection_confirmed,
+        session_key="agent:main:telegram:dm:42",
+        content="wake up",
+        plugin_id="notify-plugin",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_scheduler_fails_closed_on_gateway_loop_thread():
+    """Calling from the gateway loop itself must not deadlock: fail closed."""
+    runner = _runner(_entry())
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+
+    assert (
+        runner._schedule_plugin_message_injection_confirmed(
+            session_key="agent:main:telegram:dm:42",
+            content="wake up",
+            plugin_id="notify-plugin",
+        )
+        is False
+    )
+
+    await asyncio.sleep(0)
+    runner._dispatch_plugin_message_injection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_scheduler_timeout_cancels_before_adapter_acceptance():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(_entry(), adapter)
+    runner._gateway_loop = asyncio.get_running_loop()
+    release_lookup = asyncio.Event()
+
+    async def _slow_lookup(_session_key):
+        await release_lookup.wait()
+        return _entry()
+
+    runner._async_session_store.lookup_by_session_key = _slow_lookup
+
+    started = time.monotonic()
+    accepted = await asyncio.to_thread(
+        runner._schedule_plugin_message_injection_confirmed,
+        session_key="agent:main:telegram:dm:42",
+        content="wake up",
+        plugin_id="notify-plugin",
+        timeout_s=0.5,
+    )
+    elapsed = time.monotonic() - started
+
+    assert accepted is False
+    # timeout_s is the TOTAL bound (slack only for CI thread scheduling).
+    assert elapsed < 2.0
+
+    # After the reported False, a late lookup completion must not produce a
+    # late adapter acceptance: the loop-owned timeout cancelled the dispatch.
+    release_lookup.set()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_dispatch_observes_expired_deadline_without_dispatch():
+    """A loop that first runs the dispatch after the deadline must not send."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(_entry(), adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection_confirmed(
+        session_key="agent:main:telegram:dm:42",
+        content="wake up",
+        plugin_id="notify-plugin",
+        deadline=time.monotonic() - 0.01,
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_confirmed_scheduler_returns_completed_result_at_timeout_race():
+    """A dispatch that completed as the wait expired reports its real result."""
+    runner = _runner(_entry())
+    loop = MagicMock()
+    loop.is_closed.return_value = False
+    runner._gateway_loop = loop
+
+    race_future = MagicMock()
+    race_future.result.side_effect = [concurrent.futures.TimeoutError(), True]
+    race_future.done.return_value = True
+    race_future.cancel.side_effect = AssertionError(
+        "completed dispatch must not be cancelled"
+    )
+
+    def _submit(coro, target_loop, **_kwargs):
+        assert target_loop is loop
+        coro.close()
+        return race_future
+
+    with patch("gateway.run.safe_schedule_threadsafe", side_effect=_submit):
+        assert (
+            runner._schedule_plugin_message_injection_confirmed(
+                session_key="agent:main:telegram:dm:42",
+                content="wake up",
+                plugin_id="notify-plugin",
+            )
+            is True
+        )
+
+
+@pytest.mark.parametrize("guard", ["stopped", "no_loop", "closed_loop"])
+def test_confirmed_scheduler_rejects_unavailable_gateway(guard):
+    runner = _runner(_entry())
+    loop = MagicMock()
+    loop.is_closed.return_value = guard == "closed_loop"
+    runner._gateway_loop = None if guard == "no_loop" else loop
+    runner._running = guard != "stopped"
+
+    assert (
+        runner._schedule_plugin_message_injection_confirmed(
+            session_key="key",
+            content="wake up",
+            plugin_id="notify-plugin",
+        )
+        is False
+    )

@@ -104,6 +104,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
 | Inject messages | `ctx.inject_message(content, role="user", session_key=...)` - see [Injecting Messages](#injecting-messages) |
+| Inject with confirmed acceptance | `ctx.inject_message_confirmed(content, role="user", session_key=..., timeout_s=...)` — blocks until gateway dispatch finishes; see [Injecting Messages](#injecting-messages) |
 | Read the current session routing key | `ctx.current_session_key()` — the key accepted by `ctx.inject_message(..., session_key=...)`; see [Injecting Messages](#injecting-messages) |
 | Check gateway injection availability | `ctx.gateway_message_injection_available()` — preflight before claiming deferred delivery work; see [Injecting Messages](#injecting-messages) |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
@@ -690,6 +691,28 @@ Only grant gateway injection to plugins you trust. Hermes checks this host API p
 :::note
 This plugin API does not expose a public HTTP endpoint or CLI command for external processes. The plugin must already know the target gateway `session_key`, for example from its own trusted configuration or previously retained session state.
 :::
+
+### Confirmed injection for durable work
+
+`ctx.inject_message()` is **immediate**: in gateway mode it returns `True` as soon as the live gateway accepts the request for asynchronous dispatch. The actual dispatch — session route lookup, authorization revalidation, adapter lookup, and adapter acceptance — happens afterwards on the gateway event loop, and a failure there only appears in the gateway log. A durable outbox that marks work delivered on that `True` can silently lose it.
+
+For that pattern, use the confirmed variant from your plugin's background worker thread:
+
+**Signature:** `ctx.inject_message_confirmed(content: str, role: str = "user", *, session_key: str, timeout_s: float = 10.0) -> bool`
+
+```python
+def flush_outbox(ctx):
+    for item in list(ctx.state.get("outbox", [])):
+        if ctx.inject_message_confirmed(item["text"], session_key=item["session_key"]):
+            remove_from_outbox(ctx, item)  # confirmed accepted — safe to mark done
+        # False: keep the item claimable and retry later
+```
+
+- Same permission model and role framing as gateway-mode `ctx.inject_message()`: requires an existing `session_key` and the `allow_gateway_injection` grant (re-checked every call); non-`"user"` roles are framed as `[role] content`.
+- Returns `True` only when the dispatch actually completed and the session's adapter accepted the message. Returns `False` on rejected or unroutable session, authorization failure, gateway draining/shutdown, missing adapter, scheduling error, exception, cancellation, or timeout.
+- `timeout_s` is the **total wall-clock bound** of the call. On timeout the pending dispatch is cancelled best-effort before adapter acceptance; if dispatch had already completed when the timeout fired, its actual result is returned instead of a false negative.
+- A `True` result confirms **gateway/adapter acceptance only** — not that the agent turn ran or that platform delivery completed.
+- Never call it from the gateway event-loop thread (e.g. inside an async hook running on the gateway loop): there it fails closed to `False` instead of deadlocking. It is designed for plugin-owned worker threads.
 
 ### Checking gateway injection availability
 

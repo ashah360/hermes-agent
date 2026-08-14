@@ -2059,23 +2059,11 @@ class PluginContext:
                 cli._pending_input.put(msg)
             return True
 
-        if not session_key:
-            logger.warning(
-                "inject_message: gateway mode requires an existing session_key"
-            )
-            return False
-        if not self._gateway_injection_allowed():
-            plugin_id = self.manifest.key or self.manifest.name
-            logger.warning(
-                "inject_message: gateway injection denied for plugin %s; set "
-                "plugins.entries.%s.allow_gateway_injection: true to allow it",
-                plugin_id,
-                plugin_id,
-            )
-            return False
-
-        if not self._manager.has_gateway_message_injector:
-            logger.warning("inject_message: no live gateway is available")
+        if not self._gateway_injection_precheck(
+            "inject_message",
+            session_key,
+            self._manager.has_gateway_message_injector,
+        ):
             return False
 
         plugin_id = self.manifest.key or self.manifest.name
@@ -2094,6 +2082,91 @@ class PluginContext:
                 exc_info=True,
             )
             return False
+
+    def inject_message_confirmed(
+        self,
+        content: str,
+        role: str = "user",
+        *,
+        session_key: str,
+        timeout_s: float = 10.0,
+    ) -> bool:
+        """Inject into a gateway session and wait for dispatch acceptance.
+
+        Blocking companion to :meth:`inject_message` for durable delivery
+        workers: :meth:`inject_message` returns ``True`` once the live
+        gateway accepts the request for *asynchronous* dispatch, so later
+        route/authorization/adapter failures surface only in logs. This
+        variant blocks the calling plugin worker thread until that dispatch
+        finishes and returns ``True`` only when the session's adapter
+        accepted the message — still not agent-turn completion or platform
+        delivery. Permission model and role framing match gateway-mode
+        :meth:`inject_message`.
+
+        ``timeout_s`` is the TOTAL wall-clock bound on this call. On timeout
+        the pending dispatch is cancelled best-effort *before* adapter
+        acceptance; a dispatch already completed at the race edge reports
+        its actual result instead of a false negative. Returns ``False`` on
+        rejected route, authorization failure, gateway draining/shutdown,
+        missing adapter, scheduling error, exception, cancellation, or
+        timeout. Calls from the gateway event-loop thread fail closed to
+        ``False`` instead of deadlocking the loop the dispatch needs.
+        """
+        if not self._gateway_injection_precheck(
+            "inject_message_confirmed",
+            session_key,
+            self._manager.has_gateway_confirmed_message_injector,
+        ):
+            return False
+
+        msg = content if role == "user" else f"[{role}] {content}"
+        plugin_id = self.manifest.key or self.manifest.name
+        try:
+            return bool(
+                self._manager.inject_gateway_message_confirmed(
+                    session_key=session_key,
+                    content=msg,
+                    plugin_id=plugin_id,
+                    timeout_s=timeout_s,
+                )
+            )
+        except Exception:
+            # Includes signature mismatches: the confirmed injector is its
+            # own registered contract — no compatibility fallback.
+            logger.warning(
+                "inject_message_confirmed: gateway dispatch failed for "
+                "plugin %s",
+                plugin_id,
+                exc_info=True,
+            )
+            return False
+
+    def _gateway_injection_precheck(
+        self,
+        api: str,
+        session_key: str | None,
+        has_injector: bool,
+    ) -> bool:
+        """Shared gateway-injection gate: session key, grant, live injector."""
+        if not session_key:
+            logger.warning(
+                "%s: gateway mode requires an existing session_key", api
+            )
+            return False
+        if not self._gateway_injection_allowed():
+            plugin_id = self.manifest.key or self.manifest.name
+            logger.warning(
+                "%s: gateway injection denied for plugin %s; set "
+                "plugins.entries.%s.allow_gateway_injection: true to allow it",
+                api,
+                plugin_id,
+                plugin_id,
+            )
+            return False
+        if not has_injector:
+            logger.warning("%s: no live gateway is available", api)
+            return False
+        return True
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
@@ -3467,6 +3540,7 @@ class PluginManager:
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
         self._gateway_message_injector: tuple[object, Callable] | None = None
+        self._gateway_confirmed_message_injector: tuple[object, Callable] | None = None
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
@@ -3811,6 +3885,32 @@ class PluginManager:
     def inject_gateway_message(self, **kwargs: Any) -> bool:
         """Submit a plugin-triggered turn to the live gateway."""
         registered = self._gateway_message_injector
+        if registered is None:
+            return False
+        return bool(registered[1](**kwargs))
+
+    @property
+    def has_gateway_confirmed_message_injector(self) -> bool:
+        """Return whether a live gateway can confirm plugin-triggered turns."""
+        return self._gateway_confirmed_message_injector is not None
+
+    def set_gateway_confirmed_message_injector(
+        self,
+        owner: object,
+        injector: Callable[..., bool],
+    ) -> None:
+        """Publish a live gateway confirmed injector and its lifecycle owner."""
+        self._gateway_confirmed_message_injector = (owner, injector)
+
+    def clear_gateway_confirmed_message_injector(self, owner: object) -> None:
+        """Clear the confirmed injector only when it still belongs to ``owner``."""
+        registered = self._gateway_confirmed_message_injector
+        if registered is not None and registered[0] is owner:
+            self._gateway_confirmed_message_injector = None
+
+    def inject_gateway_message_confirmed(self, **kwargs: Any) -> bool:
+        """Submit a plugin-triggered turn and wait for its dispatch result."""
+        registered = self._gateway_confirmed_message_injector
         if registered is None:
             return False
         return bool(registered[1](**kwargs))

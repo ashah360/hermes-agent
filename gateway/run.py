@@ -17487,19 +17487,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
     def _install_plugin_message_injector(self) -> None:
-        """Publish this live gateway's plugin message scheduler."""
+        """Publish this live gateway's plugin message schedulers."""
         from hermes_cli.plugins import get_plugin_manager
 
-        get_plugin_manager().set_gateway_message_injector(
+        manager = get_plugin_manager()
+        manager.set_gateway_message_injector(
             self,
             self._schedule_plugin_message_injection,
         )
+        manager.set_gateway_confirmed_message_injector(
+            self,
+            self._schedule_plugin_message_injection_confirmed,
+        )
 
     def _clear_plugin_message_injector(self) -> None:
-        """Remove this runner's scheduler without clobbering a newer owner."""
+        """Remove this runner's schedulers without clobbering a newer owner."""
         from hermes_cli.plugins import get_plugin_manager
 
-        get_plugin_manager().clear_gateway_message_injector(self)
+        manager = get_plugin_manager()
+        manager.clear_gateway_message_injector(self)
+        manager.clear_gateway_confirmed_message_injector(self)
 
     def _schedule_plugin_message_injection(
         self,
@@ -17635,6 +17642,135 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             entry.session_id,
         )
         return True
+
+    # Slice of the confirmed-injection budget reserved for the cross-thread
+    # result handoff (gateway loop -> waiting plugin worker thread). It is
+    # carved out of the caller's timeout_s, so timeout_s remains the TOTAL
+    # wall-clock bound of _schedule_plugin_message_injection_confirmed.
+    _PLUGIN_CONFIRMED_RESULT_HANDOFF_S = 0.1
+
+    def _schedule_plugin_message_injection_confirmed(
+        self,
+        *,
+        session_key: str,
+        content: str,
+        plugin_id: str,
+        timeout_s: float = 10.0,
+    ) -> bool:
+        """Run one plugin injection dispatch and wait for its actual result.
+
+        Blocking companion to :meth:`_schedule_plugin_message_injection` for
+        plugin worker threads: ``True`` only when
+        :meth:`_dispatch_plugin_message_injection` returned ``True``.
+        ``timeout_s`` is the caller's TOTAL wall-clock bound — one absolute
+        monotonic deadline computed before scheduling; the dispatch runs
+        under a loop-owned slice of it and the thread wait never extends
+        past it. Called from the gateway event-loop thread this fails closed
+        instead of deadlocking the loop the dispatch needs.
+        """
+        try:
+            budget = float(timeout_s)
+        except (TypeError, ValueError):
+            return False
+        if budget <= 0:
+            return False
+        deadline = time.monotonic() + budget
+
+        loop = getattr(self, "_gateway_loop", None)
+        if not getattr(self, "_running", False) or loop is None or loop.is_closed():
+            return False
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is loop:
+            logger.warning(
+                "Confirmed plugin message injection called from the gateway "
+                "event-loop thread; failing closed: plugin=%s session=%s",
+                plugin_id,
+                session_key,
+            )
+            return False
+
+        future = safe_schedule_threadsafe(
+            self._dispatch_plugin_message_injection_confirmed(
+                session_key=session_key,
+                content=content,
+                plugin_id=plugin_id,
+                # Loop-owned window ends one handoff slice before the public
+                # deadline so the result crosses back within timeout_s.
+                deadline=deadline - self._PLUGIN_CONFIRMED_RESULT_HANDOFF_S,
+            ),
+            loop,
+            logger=logger,
+            log_message="Confirmed plugin message injection scheduling failed",
+            log_level=logging.WARNING,
+        )
+        if future is None:
+            return False
+
+        try:
+            return bool(
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
+            )
+        except concurrent.futures.TimeoutError:
+            # Completion-vs-timeout race: if dispatch finished as the wait
+            # expired, report its actual result rather than a false negative.
+            if future.done():
+                try:
+                    return bool(future.result())
+                except Exception:
+                    return False
+            # Best-effort cancellation keeps a not-yet-accepted dispatch from
+            # landing after this False; a dispatch the loop never started
+            # observes the expired deadline on its own and refuses to run.
+            future.cancel()
+            return False
+        except (asyncio.CancelledError, concurrent.futures.CancelledError):
+            return False
+        except Exception:
+            logger.warning(
+                "Confirmed plugin message injection failed: plugin=%s session=%s",
+                plugin_id,
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+    async def _dispatch_plugin_message_injection_confirmed(
+        self,
+        *,
+        session_key: str,
+        content: str,
+        plugin_id: str,
+        deadline: float,
+    ) -> bool:
+        """Run one dispatch under the caller's absolute monotonic deadline.
+
+        A loop that first runs this after ``deadline`` observes expiry and
+        returns ``False`` WITHOUT dispatching, so a caller that already
+        reported a timeout is never contradicted by a late acceptance.
+        Within the deadline, :func:`asyncio.wait_for` cancels the dispatch
+        at expiry but returns the completed result when dispatch finishes
+        as the timeout fires — never a knowing ``False`` after a ``True``.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            return bool(
+                await asyncio.wait_for(
+                    self._dispatch_plugin_message_injection(
+                        session_key=session_key,
+                        content=content,
+                        plugin_id=plugin_id,
+                    ),
+                    timeout=remaining,
+                )
+            )
+        except asyncio.TimeoutError:
+            return False
 
     def _get_cached_session_source(self, session_key: str):
         if not session_key:

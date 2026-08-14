@@ -4,6 +4,7 @@ from queue import SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -283,3 +284,116 @@ def test_injection_available_fails_closed_when_config_cannot_be_read():
         side_effect=OSError("config unavailable"),
     ):
         assert context.gateway_message_injection_available() is False
+
+
+# -- inject_message_confirmed() ------------------------------------------------
+#
+# Confirmed injection is a SEPARATELY registered PluginManager contract with
+# its own owner-safe lifecycle; the immediate injector stays untouched.
+
+
+@pytest.mark.parametrize(
+    "denial", ["no_session_key", "no_permission", "config_error"]
+)
+def test_confirmed_injection_precheck_fails_closed(tmp_path, monkeypatch, denial):
+    entry = {} if denial == "no_permission" else {"allow_gateway_injection": True}
+    _write_plugin_config(tmp_path, monkeypatch, entry)
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_confirmed_message_injector(object(), injector)
+
+    session_key = "" if denial == "no_session_key" else "agent:main:telegram:dm:42"
+    if denial == "config_error":
+        with patch(
+            "hermes_cli.plugins.load_config_readonly",
+            side_effect=OSError("config unavailable"),
+        ):
+            assert (
+                context.inject_message_confirmed("wake up", session_key=session_key)
+                is False
+            )
+    else:
+        assert (
+            context.inject_message_confirmed("wake up", session_key=session_key)
+            is False
+        )
+    injector.assert_not_called()
+
+
+def test_confirmed_injection_passes_framing_session_and_timeout(
+    tmp_path, monkeypatch
+):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_confirmed_message_injector(object(), injector)
+
+    result = context.inject_message_confirmed(
+        "wake up",
+        role="system",
+        session_key="agent:main:telegram:dm:42",
+        timeout_s=2.5,
+    )
+
+    assert result is True
+    injector.assert_called_once_with(
+        session_key="agent:main:telegram:dm:42",
+        content="[system] wake up",
+        plugin_id="notify-plugin",
+        timeout_s=2.5,
+    )
+
+
+def test_confirmed_injection_fails_closed_on_injector_signature_mismatch(
+    tmp_path, monkeypatch
+):
+    """No compatibility fallback: a mismatched confirmed injector fails closed."""
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(side_effect=TypeError("unexpected keyword argument"))
+    manager.set_gateway_confirmed_message_injector(object(), injector)
+
+    assert (
+        context.inject_message_confirmed(
+            "wake up",
+            session_key="agent:main:telegram:dm:42",
+        )
+        is False
+    )
+    injector.assert_called_once()
+
+
+def test_confirmed_injector_is_separate_and_owner_safe(tmp_path, monkeypatch):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    key = "agent:main:telegram:dm:42"
+
+    # The immediate injector alone must not satisfy the confirmed API.
+    manager.set_gateway_message_injector(object(), MagicMock(return_value=True))
+    assert manager.has_gateway_confirmed_message_injector is False
+    assert context.inject_message_confirmed("wake up", session_key=key) is False
+
+    owner = object()
+    manager.set_gateway_confirmed_message_injector(
+        owner, MagicMock(return_value=True)
+    )
+    assert context.inject_message_confirmed("wake up", session_key=key) is True
+
+    # A stranger's clear must not clobber the registered owner.
+    manager.clear_gateway_confirmed_message_injector(object())
+    assert manager.has_gateway_confirmed_message_injector is True
+
+    manager.clear_gateway_confirmed_message_injector(owner)
+    assert context.inject_message_confirmed("wake up", session_key=key) is False

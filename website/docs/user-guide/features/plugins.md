@@ -104,6 +104,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
 | Inject messages | `ctx.inject_message(content, role="user", session_key=...)` - see [Injecting Messages](#injecting-messages) |
+| Read the current session routing key | `ctx.current_session_key()` — the key accepted by `ctx.inject_message(..., session_key=...)`; see [Injecting Messages](#injecting-messages) |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
 | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
 | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
@@ -688,6 +689,39 @@ Only grant gateway injection to plugins you trust. Hermes checks this host API p
 :::note
 This plugin API does not expose a public HTTP endpoint or CLI command for external processes. The plugin must already know the target gateway `session_key`, for example from its own trusted configuration or previously retained session state.
 :::
+
+### Capturing the current session key
+
+`ctx.current_session_key()` returns the routing key of the session the plugin is currently executing in — the exact value `ctx.inject_message(..., session_key=...)` accepts. Use it inside a tool handler or hook to capture where a request came from, persist it if needed, and route a later injection back into the same conversation:
+
+```python
+import json
+
+
+def register(ctx):
+    def start_watch(args, **kwargs):
+        # Capture the origin route while the tool runs inside the session.
+        origin = ctx.current_session_key()
+        state = ctx.state.get("watches", [])
+        state.append({"query": args["query"], "session_key": origin})
+        ctx.state.set("watches", state)
+        return json.dumps({"success": True})
+
+    def on_external_event(event):
+        # Later (e.g. from a poller), inject back into the captured session.
+        for watch in ctx.state.get("watches", []):
+            if watch["session_key"]:
+                ctx.inject_message(
+                    f"Watch update: {event}",
+                    session_key=watch["session_key"],
+                )
+```
+
+**Signature:** `ctx.current_session_key() -> str`
+
+- The value is only meaningful **during active host execution** (an agent turn, tool call, or hook). Outside of one — for example in a plugin's own background thread — it returns `""` unless you captured it earlier.
+- Returns `""` when no session context is active or the key cannot be resolved. It never invents a placeholder key.
+- Read-only: it reveals only the current turn's route key, not other sessions.
 
 ## Calling MCP servers from plugins
 

@@ -1965,6 +1965,30 @@ class PluginContext:
 
     # -- message injection --------------------------------------------------
 
+    def current_session_key(self) -> str:
+        """Return the host's current session routing key, or ``""``.
+
+        While the plugin executes inside an active agent/tool/hook turn, this
+        returns the context-local session routing key for that turn — the
+        exact key accepted by :meth:`inject_message` via ``session_key=``.
+        A plugin can capture it during a turn (and persist it if needed) to
+        route a later injection back into the same conversation.
+
+        Returns ``""`` when no session context is active or the key cannot
+        be resolved; it never invents a placeholder key. The value is only
+        meaningful during active host execution — outside a turn (e.g. a
+        plugin's own background thread) it is empty unless captured earlier.
+
+        Read-only: this reveals only the current turn's route key, not
+        arbitrary session enumeration.
+        """
+        try:
+            from tools import approval
+
+            return approval.get_current_session_key(default="") or ""
+        except Exception:
+            return ""
+
     def inject_message(
         self,
         content: str,

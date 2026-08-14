@@ -1992,6 +1992,39 @@ class PluginContext:
         except Exception:
             return ""
 
+    def gateway_message_injection_available(self) -> bool:
+        """Return whether gateway message injection can currently work here.
+
+        Plugins load in every Hermes host process (CLI, desktop ``serve``,
+        web/dashboard, gateway), but only the gateway process installs a live
+        message injector — so the mere existence of :meth:`inject_message`
+        proves nothing about the host. This is the preflight a plugin
+        delivery worker should call BEFORE claiming durable work, so it does
+        not claim background deliveries in a host that cannot inject them.
+
+        Returns ``True`` iff THIS process currently has a live gateway
+        message injector AND this plugin's
+        ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant
+        is currently ``True``. Returns ``False`` otherwise: in non-gateway
+        hosts, during plugin initialization before the gateway installs its
+        injector, after the gateway clears it on shutdown, when the grant is
+        missing or not literally ``True``, or on any exception (fails
+        closed).
+
+        The result is a dynamic lifecycle read, never cached — re-check
+        rather than storing it. Read-only: no probing, sending, or mutation.
+        A ``True`` result is a point-in-time answer; a subsequent
+        :meth:`inject_message` can still race the gateway's lifecycle (or a
+        revoked grant) and return ``False``.
+        """
+        try:
+            return (
+                self._manager.has_gateway_message_injector
+                and self._gateway_injection_allowed()
+            )
+        except Exception:
+            return False
+
     def inject_message(
         self,
         content: str,

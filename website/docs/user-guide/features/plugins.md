@@ -105,6 +105,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
 | Inject messages | `ctx.inject_message(content, role="user", session_key=...)` - see [Injecting Messages](#injecting-messages) |
 | Read the current session routing key | `ctx.current_session_key()` — the key accepted by `ctx.inject_message(..., session_key=...)`; see [Injecting Messages](#injecting-messages) |
+| Check gateway injection availability | `ctx.gateway_message_injection_available()` — preflight before claiming deferred delivery work; see [Injecting Messages](#injecting-messages) |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
 | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
 | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
@@ -689,6 +690,27 @@ Only grant gateway injection to plugins you trust. Hermes checks this host API p
 :::note
 This plugin API does not expose a public HTTP endpoint or CLI command for external processes. The plugin must already know the target gateway `session_key`, for example from its own trusted configuration or previously retained session state.
 :::
+
+### Checking gateway injection availability
+
+Plugins load in every Hermes host process — the interactive CLI, `hermes serve`, the web dashboard, and the messaging gateway — but only the gateway process can dispatch `ctx.inject_message(..., session_key=...)` into a gateway session. Checking whether `ctx.inject_message` exists tells you nothing: the method is present in every host. Use the preflight instead:
+
+**Signature:** `ctx.gateway_message_injection_available() -> bool`
+
+Returns `True` only when **this process** currently has a live gateway message dispatcher **and** this plugin's `allow_gateway_injection` grant is currently `true`. It returns `False` in non-gateway hosts, during plugin initialization (the gateway installs its dispatcher after plugins register), after gateway shutdown, when the grant is missing or revoked, and on any internal error.
+
+```python
+def deliver_pending(ctx):
+    # Preflight: don't claim durable work this host cannot deliver.
+    if not ctx.gateway_message_injection_available():
+        return  # leave the work for the gateway process
+    for item in ctx.state.get("outbox", []):
+        ctx.inject_message(item["text"], session_key=item["session_key"])
+```
+
+- The result is a **dynamic, point-in-time read** — never cache it; re-check each delivery cycle.
+- Read-only: it performs no probing, sending, or mutation.
+- A `True` result is not a delivery guarantee. The actual `ctx.inject_message()` call can still race the gateway lifecycle (or a just-revoked grant) and return `False`, so keep unconfirmed work claimable.
 
 ### Capturing the current session key
 

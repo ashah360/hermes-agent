@@ -202,3 +202,84 @@ def test_gateway_injection_fails_closed_on_host_exception(tmp_path, monkeypatch)
         )
         is False
     )
+
+
+# -- gateway_message_injection_available() preflight -------------------------
+#
+# Plugins load in every Hermes host process (CLI, desktop serve, dashboard,
+# gateway), but only the gateway process ever installs a live message
+# injector. A plugin delivery worker must be able to check — BEFORE claiming
+# durable work — whether THIS process can actually inject, because
+# ctx.inject_message existing as a method proves nothing about the host.
+
+
+def test_injection_available_false_with_permission_but_no_injector(
+    tmp_path, monkeypatch
+):
+    """Permission granted but no live injector (CLI/serve/dashboard host)."""
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+
+    assert manager.has_gateway_message_injector is False
+    assert context.gateway_message_injection_available() is False
+
+
+def test_injection_available_false_with_injector_but_no_permission(
+    tmp_path, monkeypatch
+):
+    """Live gateway injector but the plugin lacks the config grant."""
+    _write_plugin_config(tmp_path, monkeypatch, {})
+    context, manager = _context()
+    manager.set_gateway_message_injector(object(), MagicMock(return_value=True))
+
+    assert context.gateway_message_injection_available() is False
+
+
+def test_injection_available_true_with_permission_and_live_injector(
+    tmp_path, monkeypatch
+):
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    manager.set_gateway_message_injector(object(), MagicMock(return_value=True))
+
+    assert context.gateway_message_injection_available() is True
+
+
+def test_injection_available_tracks_injector_lifecycle(tmp_path, monkeypatch):
+    """Dynamic read, not cached: false -> true -> false across the lifecycle."""
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    owner = object()
+
+    # Before the gateway installs its injector (plugin initialization time).
+    assert context.gateway_message_injection_available() is False
+
+    manager.set_gateway_message_injector(owner, MagicMock(return_value=True))
+    assert context.gateway_message_injection_available() is True
+
+    # Owner-safe clear (gateway shutdown) drops availability again.
+    manager.clear_gateway_message_injector(owner)
+    assert context.gateway_message_injection_available() is False
+
+
+def test_injection_available_fails_closed_when_config_cannot_be_read():
+    context, manager = _context()
+    manager.set_gateway_message_injector(object(), MagicMock(return_value=True))
+
+    with patch(
+        "hermes_cli.plugins.load_config_readonly",
+        side_effect=OSError("config unavailable"),
+    ):
+        assert context.gateway_message_injection_available() is False

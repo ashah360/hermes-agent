@@ -1985,7 +1985,10 @@ class PluginContext:
         try:
             from tools import approval
 
-            return approval.get_current_session_key(default="") or ""
+            # Context-only resolver: never falls through to the process-global
+            # HERMES_SESSION_KEY env fallback, so an unbound context (e.g. a
+            # plugin background thread) resolves to "" instead of a stale key.
+            return approval.get_context_bound_session_key() or ""
         except Exception:
             return ""
 

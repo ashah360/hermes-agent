@@ -238,6 +238,23 @@ def get_current_session_key(default: str = "default") -> str:
     return get_session_env("HERMES_SESSION_KEY", default)
 
 
+def get_context_bound_session_key() -> str:
+    """Return the session key bound to the *current context*, or ``""``.
+
+    Unlike :func:`get_current_session_key` — which keeps a backward-compatible
+    fallback chain through ``session_context`` contextvars and finally the
+    process-global ``HERMES_SESSION_KEY`` env var for legacy single-threaded
+    callers — this resolver reads ONLY the approval contextvar bound by
+    :func:`set_current_session_key` and NEVER falls through to
+    ``session_context`` or ``os.environ``.
+
+    Use it wherever an unbound context must resolve to "no active session"
+    rather than a stale process-global key (e.g. a plugin background thread
+    with no copied context must not inherit another conversation's route key).
+    """
+    return _approval_session_key.get() or ""
+
+
 def _get_session_platform() -> str:
     """Return the current gateway platform from contextvars/env fallback."""
     try:

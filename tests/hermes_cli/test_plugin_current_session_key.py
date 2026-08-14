@@ -1,6 +1,8 @@
 """Tests for PluginContext.current_session_key() session routing exposure."""
 
 import contextvars
+import os
+import threading
 from unittest.mock import patch
 
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
@@ -54,11 +56,43 @@ def test_current_session_key_is_context_local_across_copied_contexts():
     assert context.current_session_key() == ""
 
 
+def test_current_session_key_ignores_process_global_env_on_fresh_thread():
+    """A plugin background thread must never inherit HERMES_SESSION_KEY.
+
+    The process-global env var can hold a stale or unrelated route key (CLI,
+    cron, or a previously active gateway session). A fresh thread with no
+    copied session context has no active turn, so the resolver must return
+    ``""`` — never the env fallback — or a plugin could inject into the
+    wrong conversation.
+    """
+    context, _ = _context()
+
+    sentinel = object()
+    prior = os.environ.get("HERMES_SESSION_KEY", sentinel)
+    os.environ["HERMES_SESSION_KEY"] = "stale-or-unrelated-session"
+    try:
+        results: list[str] = []
+        # threading.Thread targets run in a fresh contextvars.Context — no
+        # copied active session context, exactly like a plugin's own
+        # background worker thread.
+        thread = threading.Thread(
+            target=lambda: results.append(context.current_session_key())
+        )
+        thread.start()
+        thread.join()
+        assert results == [""]
+    finally:
+        if prior is sentinel:
+            os.environ.pop("HERMES_SESSION_KEY", None)
+        else:
+            os.environ["HERMES_SESSION_KEY"] = prior
+
+
 def test_current_session_key_fails_closed_when_resolver_raises():
     context, _ = _context()
 
     with patch(
-        "tools.approval.get_current_session_key",
+        "tools.approval.get_context_bound_session_key",
         side_effect=RuntimeError("resolver unavailable"),
     ):
         assert context.current_session_key() == ""

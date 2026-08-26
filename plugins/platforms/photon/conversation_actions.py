@@ -226,6 +226,30 @@ def resolve_target_message_id(
     return str(target_id), None
 
 
+def _resolve_trigger_message_id(adapter: Any, session_key: str) -> str:
+    """Resolve this turn's trigger: live steer-aware anchor, then turn env.
+
+    The gateway retargets a running turn's reply anchor on every SUCCESSFUL
+    mid-turn steer (``BasePlatformAdapter.update_active_turn_reply_anchor``),
+    while ``HERMES_SESSION_MESSAGE_ID`` stays pinned to the event that
+    STARTED the turn. Exact conversation actions must follow the same
+    ownership rule as final delivery — the latest successful steer owns the
+    turn — so consult the adapter's live anchor first. Failed, queued,
+    synthetic, and cross-session events never move that anchor, and turn
+    completion clears it, so the fallback to the turn-start binding only
+    engages when no anchored active turn exists (inline dispatch paths).
+    """
+    anchor_fn = getattr(adapter, "active_turn_reply_anchor_message_id", None)
+    if callable(anchor_fn) and session_key:
+        try:
+            anchored = anchor_fn(session_key)
+        except Exception:
+            anchored = None
+        if anchored:
+            return str(anchored)
+    return get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+
+
 def _resolve_runtime() -> Tuple[Any, Any, str, str]:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
     chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
@@ -303,7 +327,7 @@ async def conversation_action_tool(args: Dict[str, Any], **kwargs: Any) -> str:
             presentation="group",
         )
 
-    trigger_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+    trigger_id = _resolve_trigger_message_id(adapter, session_key)
     target_id, target_error = resolve_target_message_id(
         session_id=session_id,
         trigger_message_id=trigger_id,

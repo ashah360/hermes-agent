@@ -6004,6 +6004,27 @@ class BasePlatformAdapter(ABC):
         state.event = event
         return True
 
+    def active_turn_reply_anchor_message_id(
+        self, session_key: str
+    ) -> Optional[str]:
+        """Return the ACTIVE turn's current reply-anchor provider message id.
+
+        Read-only view over the per-turn anchor shared with steer ingress:
+        it starts as the event that began the turn, moves only on a
+        successful mid-turn steer (``update_active_turn_reply_anchor``), and
+        is discarded when the turn finishes. Consumers that must follow the
+        same ownership rule as final delivery — the latest successful steer
+        owns the turn — read the live trigger identity here instead of the
+        turn-start ``HERMES_SESSION_MESSAGE_ID`` binding. Returns ``None``
+        when no turn is active for ``session_key`` or the anchoring event
+        carries no provider message id.
+        """
+        state = getattr(self, "_active_turn_reply_anchors", {}).get(session_key)
+        if state is None:
+            return None
+        message_id = getattr(state.event, "message_id", None)
+        return str(message_id) if message_id else None
+
     async def cancel_session_processing(
         self,
         session_key: str,

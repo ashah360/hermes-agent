@@ -21,6 +21,10 @@
 //   - POST /send        -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "text": "...",
 //              "format": "text" | "markdown" (default "text")}
+//   - POST /send-batch  -> {"ok": true, "complete": true | false,
+//                           "messageIds": ["..."], "failedIndex": 1 | null}
+//       body: {"spaceId": "...", "chunks": ["...", "..."],
+//              "format": "text" | "markdown" (default "text")}
 //   - POST /send-richlink -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "url": "https://..."}
 //   - POST /send-attachment -> {"ok": true, "messageId": "..."}
@@ -78,6 +82,7 @@ import {
   setExactReaction,
   sendExactReply,
   sendImageGroup,
+  sendTextBatch,
 } from "./conversation-actions.mjs";
 import {
   classifyProbeRejection,
@@ -1055,6 +1060,36 @@ const server = http.createServer(async (req, res) => {
           : spectrumText(text);
       const result = await space.send(builder);
       return ok(res, { messageId: result?.id || null });
+    }
+    if (req.url === "/send-batch") {
+      const { spaceId, chunks, format = "text" } = body || {};
+      if (!spaceId || !Array.isArray(chunks) || chunks.length < 2) {
+        return badRequest(res, "spaceId and at least two chunks are required");
+      }
+      if (
+        chunks.some(
+          (chunk) =>
+            typeof chunk !== "string" || !chunk || chunk.length > 8000
+        )
+      ) {
+        return badRequest(
+          res,
+          "chunks must be non-empty strings no longer than 8000 characters"
+        );
+      }
+      if (format !== "text" && format !== "markdown") {
+        return badRequest(res, "format must be text or markdown");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await sendTextBatch({
+        space,
+        chunks,
+        buildContent: (chunk) =>
+          chooseSendFormat(format, chunk) === "markdown"
+            ? spectrumMarkdown(chunk)
+            : spectrumText(chunk),
+      });
+      return ok(res, result);
     }
     if (req.url === "/send-richlink") {
       const { spaceId, url } = body || {};

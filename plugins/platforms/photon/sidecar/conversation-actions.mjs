@@ -139,3 +139,31 @@ export async function sendImageGroup({
     partCount: children.length,
   };
 }
+
+export async function sendTextBatch({ space, chunks, buildContent }) {
+  if (!Array.isArray(chunks) || chunks.length < 2) {
+    throw new TypeError("text batches require at least two chunks");
+  }
+  if (chunks.some((chunk) => typeof chunk !== "string" || !chunk)) {
+    throw new TypeError("text batch chunks must be non-empty strings");
+  }
+
+  const messageIds = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    try {
+      const message = await space.send(buildContent(chunks[index]));
+      if (!message?.id) {
+        throw new Error("text chunk did not return a message identifier");
+      }
+      messageIds.push(message.id);
+    } catch (error) {
+      return {
+        complete: false,
+        messageIds,
+        failedIndex: index,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+  return { complete: true, messageIds };
+}

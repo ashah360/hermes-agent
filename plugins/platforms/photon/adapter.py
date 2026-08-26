@@ -803,6 +803,11 @@ class PhotonAdapter(BasePlatformAdapter):
         self.conversation_actions_enabled = (
             extra.get("conversation_actions_enabled") is True
         )
+        self.semantic_chunking_enabled = (
+            extra.get("semantic_chunking_enabled") is True
+        )
+        self._semantic_chunk_soft_chars = extra.get("semantic_chunk_soft_chars")
+        self._semantic_chunk_hard_chars = extra.get("semantic_chunk_hard_chars")
 
         # Runtime state
         self._sidecar_proc: Optional[subprocess.Popen] = None
@@ -2001,7 +2006,18 @@ class PhotonAdapter(BasePlatformAdapter):
                 reply_to,
                 [{"type": "text", "text": self.format_message(content)}],
             )
-        return await self._sidecar_send(chat_id, self.format_message(content))
+        formatted = self.format_message(content)
+        if self.semantic_chunking_enabled:
+            from .text_chunks import chunk_photon_text
+
+            chunks = chunk_photon_text(
+                formatted,
+                soft_chars=self._semantic_chunk_soft_chars,
+                hard_chars=self._semantic_chunk_hard_chars,
+            )
+            if len(chunks) > 1:
+                return await self._sidecar_send_batch(chat_id, chunks)
+        return await self._sidecar_send(chat_id, formatted)
 
     # -- Clarify (native iMessage poll) ------------------------------------
     #
@@ -2528,6 +2544,13 @@ class PhotonAdapter(BasePlatformAdapter):
         if reply_to:
             return result
 
+        if isinstance(result.raw_response, dict) and result.raw_response.get(
+            "partial_delivery"
+        ):
+            # Some bubbles are already visible. A whole-response retry would
+            # duplicate the acknowledged prefix.
+            return result
+
         if self._is_permanent_sidecar_failure(result):
             # Permanent failure classes: retrying cannot succeed and the
             # unconditional plain-text fallback below would double-send the
@@ -2642,6 +2665,63 @@ class PhotonAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
+
+    async def _sidecar_send_batch(
+        self, space_id: str, chunks: list[str]
+    ) -> SendResult:
+        body: Dict[str, Any] = {"spaceId": space_id, "chunks": list(chunks)}
+        if _markdown_enabled():
+            body["format"] = "markdown"
+        try:
+            data = await self._sidecar_call("/send-batch", body)
+        except PhotonSidecarError as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                raw_response={
+                    "error_class": exc.error_class,
+                    "retryable": exc.retryable,
+                },
+                retryable=exc.retryable,
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+        message_ids = tuple(data.get("messageIds") or ())
+        for message_id in message_ids:
+            self._record_sent_message(message_id)
+        if not data.get("complete"):
+            return SendResult(
+                success=False,
+                message_id=message_ids[-1] if message_ids else None,
+                error=(
+                    f"Photon text batch stopped at chunk "
+                    f"{int(data.get('failedIndex') or 0) + 1}: "
+                    f"{data.get('error') or 'send failed'}"
+                ),
+                raw_response={
+                    "partial_delivery": True,
+                    "acknowledged_message_ids": list(message_ids),
+                    "failed_index": data.get("failedIndex"),
+                    "total_chunks": len(chunks),
+                },
+            )
+        if len(message_ids) != len(chunks):
+            return SendResult(
+                success=False,
+                error="Photon returned an incomplete text-batch receipt",
+                raw_response={"partial_delivery": True},
+            )
+        return SendResult(
+            success=True,
+            message_id=message_ids[-1],
+            continuation_message_ids=message_ids[:-1],
+            raw_response={
+                "message_ids": list(message_ids),
+                "part_count": len(message_ids),
+                "presentation": "chunks",
+            },
+        )
 
     async def _sidecar_send_poll(
         self, space_id: str, title: str, options: list,

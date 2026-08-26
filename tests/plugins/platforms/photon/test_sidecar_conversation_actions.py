@@ -23,6 +23,7 @@ import {{
   setExactReaction,
   sendExactReply,
   sendImageGroup,
+  sendTextBatch,
 }} from {json.dumps(SIDECAR_MODULE.as_uri())};
 
 const cachedTarget = {{ id: "cached" }};
@@ -137,6 +138,42 @@ await assert.rejects(() => sendImageGroup({{
   group: (...items) => items,
 }}), /upload preparation failed/);
 assert.equal(failedVisibleSends, 0);
+
+const started = [];
+let inFlight = 0;
+const ordered = await sendTextBatch({{
+  space: {{
+    async send(chunk) {{
+      assert.equal(inFlight, 0);
+      inFlight += 1;
+      started.push(chunk);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      inFlight -= 1;
+      return {{ id: `text-${{started.length - 1}}` }};
+    }},
+  }},
+  chunks: ["first", "second", "third"],
+  buildContent: (chunk) => chunk,
+}});
+assert.deepEqual(started, ["first", "second", "third"]);
+assert.deepEqual(ordered.messageIds, ["text-0", "text-1", "text-2"]);
+assert.equal(ordered.complete, true);
+
+let attempts = 0;
+const partial = await sendTextBatch({{
+  space: {{
+    async send(chunk) {{
+      attempts += 1;
+      if (chunk === "second") throw new Error("stopped");
+      return {{ id: "only-first" }};
+    }},
+  }},
+  chunks: ["first", "second", "never"],
+  buildContent: (chunk) => chunk,
+}});
+assert.equal(attempts, 2);
+assert.deepEqual(partial.messageIds, ["only-first"]);
+assert.equal(partial.failedIndex, 1);
 """,
         encoding="utf-8",
     )

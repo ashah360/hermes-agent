@@ -156,18 +156,56 @@ def _resolve_session_id(runner: Any, explicit: str, session_key: str) -> str:
     return get_session_env("HERMES_SESSION_ID", "")
 
 
+#: display_metadata key persisting a debounced turn's ordered bubble ids so
+#: messages_back can address individual constituents after restart without
+#: exposing extra user turns to the model.
+CONSTITUENT_METADATA_KEY = "constituent_message_ids"
+
+
+def _expand_user_bubbles(message: Dict[str, Any]) -> list:
+    """Ordered addressable ids one persisted user row represents.
+
+    A debounced turn persists ONE user row (role alternation intact) whose
+    display_metadata carries the ordered constituent provider ids; expand it
+    so messages_back counts real bubbles. Ordinary rows are one bubble; rows
+    without any identity contribute one non-addressable placeholder so
+    counting still spaces correctly.
+    """
+    metadata = message.get("display_metadata")
+    constituent_ids = (
+        metadata.get(CONSTITUENT_METADATA_KEY) if isinstance(metadata, dict) else None
+    )
+    if isinstance(constituent_ids, list) and constituent_ids:
+        return [str(entry) if entry else None for entry in constituent_ids]
+    platform_id = message.get("message_id")
+    return [str(platform_id) if platform_id else None]
+
+
 def resolve_target_message_id(
     *,
     session_id: str,
     trigger_message_id: str,
     messages_back: int,
     db: Any = None,
+    turn_constituents: Optional[list] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Resolve a user bubble relative to this turn's exact persisted trigger."""
-    if not trigger_message_id:
+    """Resolve a user bubble relative to this turn's exact trigger.
+
+    ``turn_constituents`` is the ACTIVE turn's ordered addressable bubble
+    sequence (oldest → newest — debounced constituents plus successful
+    steers). ``messages_back`` consumes it newest-first, then continues into
+    prior persisted user bubbles, skipping any persisted copy of the current
+    turn so a mid-turn crash persist can never double-count.
+    """
+    constituents = [str(entry) for entry in (turn_constituents or []) if entry]
+    if not constituents and trigger_message_id:
+        constituents = [str(trigger_message_id)]
+    if not constituents:
         return None, "the triggering Photon message has no platform identifier"
-    if messages_back == 0:
-        return trigger_message_id, None
+    if not trigger_message_id:
+        trigger_message_id = constituents[-1]
+    if messages_back < len(constituents):
+        return constituents[-1 - messages_back], None
     if not session_id:
         return None, "the active conversation has no durable session"
 
@@ -207,47 +245,82 @@ def resolve_target_message_id(
         unique_reversed.append(message)
     user_messages = list(reversed(unique_reversed))
 
-    trigger_index = next(
-        (
-            index
-            for index in range(len(user_messages) - 1, -1, -1)
-            if user_messages[index].get("message_id") == trigger_message_id
-        ),
-        -1,
-    )
-    target_index = trigger_index - messages_back
-    if trigger_index < 0:
-        return None, "the triggering message is not present in this conversation"
+    # Flatten persisted user rows into real bubbles (oldest → newest).
+    persisted_bubbles: list = []
+    for message in user_messages:
+        persisted_bubbles.extend(_expand_user_bubbles(message))
+
+    if turn_constituents:
+        # Live-anchored turn: it belongs to this session by construction.
+        # Skip persisted copies of the current turn's bubbles (dedupe), then
+        # keep walking back from the newest prior bubble.
+        constituent_set = set(constituents)
+        prior = [
+            bubble
+            for bubble in persisted_bubbles
+            if bubble is None or bubble not in constituent_set
+        ]
+        sequence = prior + constituents
+    else:
+        # Turn-env fallback: the trigger must belong to this conversation;
+        # anchor the walk at its persisted position.
+        trigger_index = next(
+            (
+                index
+                for index in range(len(persisted_bubbles) - 1, -1, -1)
+                if persisted_bubbles[index] == trigger_message_id
+            ),
+            -1,
+        )
+        if trigger_index < 0:
+            return None, "the triggering message is not present in this conversation"
+        sequence = persisted_bubbles[: trigger_index + 1]
+
+    target_index = len(sequence) - 1 - messages_back
     if target_index < 0:
         return None, f"no user message exists {messages_back} back"
-    target_id = user_messages[target_index].get("message_id")
+    target_id = sequence[target_index]
     if not target_id:
         return None, "the selected historical message predates platform-id persistence"
     return str(target_id), None
 
 
-def _resolve_trigger_message_id(adapter: Any, session_key: str) -> str:
-    """Resolve this turn's trigger: live steer-aware anchor, then turn env.
+def _resolve_trigger_context(
+    adapter: Any, session_key: str
+) -> Tuple[str, list]:
+    """Resolve this turn's trigger id and ordered addressable bubble ids.
 
     The gateway retargets a running turn's reply anchor on every SUCCESSFUL
     mid-turn steer (``BasePlatformAdapter.update_active_turn_reply_anchor``),
     while ``HERMES_SESSION_MESSAGE_ID`` stays pinned to the event that
     STARTED the turn. Exact conversation actions must follow the same
     ownership rule as final delivery — the latest successful steer owns the
-    turn — so consult the adapter's live anchor first. Failed, queued,
-    synthetic, and cross-session events never move that anchor, and turn
-    completion clears it, so the fallback to the turn-start binding only
-    engages when no anchored active turn exists (inline dispatch paths).
+    turn — so consult the adapter's live anchor first: its constituent
+    sequence expands a debounced/steered turn into real bubbles (trigger =
+    newest). Failed, queued, synthetic, and cross-session events never move
+    that anchor, and turn completion clears it, so the fallback to the
+    turn-start binding only engages when no anchored active turn exists
+    (inline dispatch paths).
     """
-    anchor_fn = getattr(adapter, "active_turn_reply_anchor_message_id", None)
-    if callable(anchor_fn) and session_key:
-        try:
-            anchored = anchor_fn(session_key)
-        except Exception:
-            anchored = None
-        if anchored:
-            return str(anchored)
-    return get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+    if session_key:
+        ids_fn = getattr(adapter, "active_turn_constituent_message_ids", None)
+        if callable(ids_fn):
+            try:
+                anchor_ids = [str(i) for i in (ids_fn(session_key) or []) if i]
+            except Exception:
+                anchor_ids = []
+            if anchor_ids:
+                return anchor_ids[-1], anchor_ids
+        anchor_fn = getattr(adapter, "active_turn_reply_anchor_message_id", None)
+        if callable(anchor_fn):
+            try:
+                anchored = anchor_fn(session_key)
+            except Exception:
+                anchored = None
+            if anchored:
+                return str(anchored), [str(anchored)]
+    trigger = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+    return trigger, []
 
 
 def _resolve_runtime() -> Tuple[Any, Any, str, str]:
@@ -327,11 +400,12 @@ async def conversation_action_tool(args: Dict[str, Any], **kwargs: Any) -> str:
             presentation="group",
         )
 
-    trigger_id = _resolve_trigger_message_id(adapter, session_key)
+    trigger_id, turn_constituents = _resolve_trigger_context(adapter, session_key)
     target_id, target_error = resolve_target_message_id(
         session_id=session_id,
         trigger_message_id=trigger_id,
         messages_back=messages_back,
+        turn_constituents=turn_constituents,
     )
     if target_error or not target_id:
         return _error("target_unavailable", target_error or "message target unavailable")

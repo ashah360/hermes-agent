@@ -2680,6 +2680,7 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
+    event_constituent_message_ids,
     merge_pending_message_event,
     utf16_len,
 )
@@ -6426,6 +6427,10 @@ class TurnRunner:
             if ctx.persist_user_message_id:
                 _conversation_kwargs["persist_user_message_id"] = (
                     ctx.persist_user_message_id
+                )
+            if ctx.persist_user_display_metadata:
+                _conversation_kwargs["persist_user_display_metadata"] = (
+                    ctx.persist_user_display_metadata
                 )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
@@ -20441,6 +20446,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            # A debounced/merged turn persists ONE user row; its ordered real
+            # bubble ids ride display_metadata (DB-only sidecar) so
+            # exact-message actions can address constituents after a restart
+            # without exposing extra user turns to the model.
+            _constituent_ids = event_constituent_message_ids(event)
+            _persist_user_display_metadata = (
+                {"constituent_message_ids": _constituent_ids}
+                if len(_constituent_ids) > 1
+                else None
+            )
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -20455,6 +20470,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_message_id=source.message_id,
+                persist_user_display_metadata=_persist_user_display_metadata,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
             )
@@ -28180,6 +28196,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         persist_user_message_id: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28199,6 +28216,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_message_id=persist_user_message_id,
+                persist_user_display_metadata=persist_user_display_metadata,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
@@ -28213,6 +28231,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_message_id=persist_user_message_id,
+                persist_user_display_metadata=persist_user_display_metadata,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
@@ -28359,6 +28378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         persist_user_message_id: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28668,6 +28688,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_message_id=persist_user_message_id,
+            persist_user_display_metadata=persist_user_display_metadata,
             persist_user_display_kind=persist_user_display_kind,
         )
         turn_runner = TurnRunner(self, turn_ctx)

@@ -2376,6 +2376,33 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+@dataclass(frozen=True)
+class ConstituentMessage:
+    """One real provider bubble folded into a merged/debounced MessageEvent."""
+
+    text: str
+    message_id: str
+
+
+def event_constituent_message_ids(event: Any) -> List[str]:
+    """Ordered addressable provider ids represented by one MessageEvent.
+
+    A debounced/merged event expands to its constituent bubbles; an ordinary
+    event is its own single bubble. Events without any provider identity
+    return ``[]`` — they are never addressable anchors.
+    """
+    constituents = getattr(event, "constituent_messages", None) or []
+    ids = [
+        str(entry.message_id)
+        for entry in constituents
+        if getattr(entry, "message_id", None)
+    ]
+    if ids:
+        return ids
+    message_id = getattr(event, "message_id", None)
+    return [str(message_id)] if message_id else []
+
+
 @dataclass
 class MessageEvent:
     """
@@ -2402,6 +2429,15 @@ class MessageEvent:
     # Original platform data
     raw_message: Any = None
     message_id: Optional[str] = None
+
+    # Ordered ledger of the REAL provider bubbles folded into this event by
+    # text debounce / pending-slot text merge (oldest → newest). ``None`` for
+    # an ordinary single-bubble event. Each entry keeps the bubble's exact
+    # text and provider message id so exact-message actions (reactions,
+    # threaded replies) can address individual bubbles even though the model
+    # receives ONE combined text turn. Bubbles without a provider id merge
+    # their text but are never addressable, so they carry no entry.
+    constituent_messages: Optional[List["ConstituentMessage"]] = None
 
     # Platform-specific update identifier.  For Telegram this is the
     # ``update_id`` from the PTB Update wrapper; other platforms currently
@@ -2544,9 +2580,21 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
 
 @dataclass
 class _ActiveTurnReplyAnchor:
-    """Mutable per-turn visible-delivery anchor shared with steer ingress."""
+    """Mutable per-turn visible-delivery anchor shared with steer ingress.
+
+    ``constituent_ids`` is the turn's ordered addressable bubble sequence
+    (oldest → newest): the starting event's constituents, extended by every
+    SUCCESSFUL mid-turn steer. Failed/queued/synthetic/no-id/cross-session
+    events never reach it, and the whole anchor is discarded when the turn
+    finishes.
+    """
 
     event: MessageEvent
+    constituent_ids: Optional[List[str]] = None
+
+    def __post_init__(self) -> None:
+        if self.constituent_ids is None:
+            self.constituent_ids = event_constituent_message_ids(self.event)
 
 
 @dataclass
@@ -2783,6 +2831,38 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _seed_constituent_ledger(event: MessageEvent) -> None:
+    """Initialize an event's constituent ledger from its pristine identity.
+
+    Must run BEFORE the first text merge mutates ``event.text`` — the entry
+    captures the original single bubble exactly. A bubble without a provider
+    id contributes no entry (it can never be an addressable anchor), but its
+    text still participates in the combined turn.
+    """
+    if event.constituent_messages is not None:
+        return
+    if event.message_id:
+        event.constituent_messages = [
+            ConstituentMessage(text=event.text or "", message_id=str(event.message_id))
+        ]
+    else:
+        event.constituent_messages = []
+
+
+def _extend_constituent_ledger(target: MessageEvent, incoming: MessageEvent) -> None:
+    """Append ``incoming``'s real bubbles to ``target``'s ordered ledger."""
+    if target.constituent_messages is None:
+        _seed_constituent_ledger(target)
+    incoming_entries = list(incoming.constituent_messages or [])
+    if not incoming_entries and incoming.message_id:
+        incoming_entries = [
+            ConstituentMessage(
+                text=incoming.text or "", message_id=str(incoming.message_id)
+            )
+        ]
+    target.constituent_messages.extend(incoming_entries)
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2840,6 +2920,10 @@ def merge_pending_message_event(
             and getattr(existing, "message_type", None) == MessageType.TEXT
             and event.message_type == MessageType.TEXT
         ):
+            # Preserve per-bubble provider identity across the pending-slot
+            # text merge (ledger seeded before the text mutation below).
+            _seed_constituent_ledger(existing)
+            _extend_constituent_ledger(existing, event)
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
@@ -5811,6 +5895,12 @@ class BasePlatformAdapter(ABC):
             )
             store[session_key] = state
         else:
+            # Record the real bubbles BEFORE mutating text/message_id so
+            # exact-message actions can still address each provider bubble
+            # after the texts are folded into one turn. Seed the ledger from
+            # the still-pristine first bubble on the first merge.
+            _seed_constituent_ledger(state.event)
+            _extend_constituent_ledger(state.event, event)
             if event.text:
                 state.event.text = (
                     f"{state.event.text}\n{event.text}"
@@ -6006,6 +6096,15 @@ class BasePlatformAdapter(ABC):
         if state is None:
             return False
         state.event = event
+        # Extend the turn's addressable bubble sequence: the steer's bubbles
+        # become the newest constituents (re-steering the same id moves it to
+        # the end rather than duplicating it).
+        if state.constituent_ids is None:
+            state.constituent_ids = []
+        for message_id in event_constituent_message_ids(event):
+            if message_id in state.constituent_ids:
+                state.constituent_ids.remove(message_id)
+            state.constituent_ids.append(message_id)
         return True
 
     def active_turn_reply_anchor_message_id(
@@ -6028,6 +6127,19 @@ class BasePlatformAdapter(ABC):
             return None
         message_id = getattr(state.event, "message_id", None)
         return str(message_id) if message_id else None
+
+    def active_turn_constituent_message_ids(self, session_key: str) -> List[str]:
+        """Ordered addressable bubble ids for the ACTIVE turn (oldest → newest).
+
+        Expands the live anchor into the real provider bubbles this turn
+        represents: the debounced constituents of the event that started the
+        turn plus every successful mid-turn steer, newest last. ``[]`` when no
+        turn is active for ``session_key`` or nothing addressable exists.
+        """
+        state = getattr(self, "_active_turn_reply_anchors", {}).get(session_key)
+        if state is None:
+            return []
+        return list(state.constituent_ids or [])
 
     async def cancel_session_processing(
         self,

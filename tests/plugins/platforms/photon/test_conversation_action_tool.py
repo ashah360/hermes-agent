@@ -477,6 +477,111 @@ async def test_trigger_follows_latest_successful_steer_and_resets_next_turn(
 
 
 @pytest.mark.asyncio
+async def test_debounced_bubbles_stay_individually_addressable(
+    monkeypatch, tmp_path
+):
+    """Three rapid bubbles A/B/C debounce into ONE combined agent turn, but
+    each real provider bubble stays addressable: trigger resolves the latest
+    constituent (C), messages_back 1/2 resolve B/A within the live turn, and
+    after the turn completes the next turn D resolves trigger D with
+    messages_back 1 continuing into C through persisted constituent identity.
+    """
+    from hermes_state import SessionDB
+
+    adapter = _AnchorAdapter()
+    session_key = build_session_key(_anchor_event("spc-A").source)
+
+    # Rapid same-sender burst through the REAL debounce + pending-slot merge.
+    await adapter._queue_text_debounce(session_key, _anchor_event("spc-A"))
+    await adapter._queue_text_debounce(session_key, _anchor_event("spc-B"))
+    await adapter._queue_text_debounce(session_key, _anchor_event("spc-C"))
+    assert await adapter._flush_text_debounce_now(session_key)
+    merged = adapter._pending_messages.pop(session_key)
+
+    # One coherent model turn, arrival order; exact per-bubble identity kept.
+    assert merged.text == "spc-A\nspc-B\nspc-C"
+    assert [
+        (entry.text, entry.message_id) for entry in merged.constituent_messages
+    ] == [("spc-A", "spc-A"), ("spc-B", "spc-B"), ("spc-C", "spc-C")]
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_event):
+        entered.set()
+        await release.wait()
+        return "final"
+
+    adapter.set_message_handler(handler)
+    assert adapter._start_session_processing(merged, session_key)
+    await entered.wait()
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.create_session("photon-session", source="photon")
+    monkeypatch.setattr(
+        actions,
+        "_open_session_db",
+        lambda: SessionDB(db_path=db_path, read_only=True),
+    )
+    monkeypatch.setattr(
+        actions,
+        "_resolve_runtime",
+        lambda: (object(), adapter, "chat-1", session_key),
+    )
+    monkeypatch.setattr(actions, "_resolve_session_id", lambda *_args: "photon-session")
+    monkeypatch.setattr(
+        actions,
+        "get_session_env",
+        lambda name, default="": (
+            "spc-C" if name == "HERMES_SESSION_MESSAGE_ID" else default
+        ),
+    )
+
+    async def _target(spec):
+        return json.loads(
+            await actions.conversation_action_tool(
+                {"action": "react", "target": spec, "emoji": "❤️"}
+            )
+        )["target_message_id"]
+
+    assert await _target({"trigger": True}) == "spc-C"
+    assert await _target({"messages_back": 1}) == "spc-B"
+    assert await _target({"messages_back": 2}) == "spc-A"
+
+    # Persist the combined turn exactly as the gateway does: ONE user row
+    # (role alternation intact), latest constituent as its platform id, the
+    # full ordered constituent identity in DB-only display metadata.
+    db.append_message(
+        "photon-session",
+        "user",
+        "spc-A\nspc-B\nspc-C",
+        platform_message_id="spc-C",
+        display_metadata={"constituent_message_ids": ["spc-A", "spc-B", "spc-C"]},
+    )
+    db.append_message("photon-session", "assistant", "final")
+
+    # Turn completion clears the live anchor.
+    release.set()
+    await adapter._session_tasks[session_key]
+    assert adapter.active_turn_constituent_message_ids(session_key) == []
+
+    # Next turn D: trigger is D; messages_back walks back into the persisted
+    # constituents (C, then B, then A) without duplicates.
+    release.clear()
+    entered.clear()
+    assert adapter._start_session_processing(_anchor_event("spc-D"), session_key)
+    await entered.wait()
+    assert await _target({"trigger": True}) == "spc-D"
+    assert await _target({"messages_back": 1}) == "spc-C"
+    assert await _target({"messages_back": 2}) == "spc-B"
+    assert await _target({"messages_back": 3}) == "spc-A"
+    release.set()
+    await adapter._session_tasks[session_key]
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_non_photon_context_fails_without_dispatch(monkeypatch):
     monkeypatch.setattr(actions, "_resolve_runtime", lambda: (None, None, "", ""))
 

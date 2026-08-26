@@ -120,6 +120,73 @@ def test_resolves_exact_trigger_and_earlier_persisted_user_bubbles(tmp_path):
     restarted.close()
 
 
+def test_debounced_turn_constituents_survive_agent_flush_for_messages_back(tmp_path):
+    """A debounced multi-bubble turn persists ONE user row whose
+    display_metadata carries the ordered constituent provider ids (what
+    build_turn_context stamps from persist_user_display_metadata). After the
+    real agent flush — i.e. across turn completion or a restart —
+    messages_back must address the individual bubbles, then continue into
+    earlier persisted turns, without exposing extra user rows.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("photon-session", source="photon")
+    agent = _agent_with_db(db, "photon-session")
+
+    messages = [
+        {"role": "user", "content": "earlier", "message_id": "spc-earlier"},
+        {"role": "assistant", "content": "ok"},
+        {
+            "role": "user",
+            "content": "A\nB\nC",
+            "message_id": "spc-C",
+            "display_metadata": {
+                "constituent_message_ids": ["spc-A", "spc-B", "spc-C"]
+            },
+        },
+        {"role": "assistant", "content": "!!"},
+    ]
+    assert agent._flush_messages_to_session_db(messages) is True
+
+    # Exactly two user rows persisted — the combined turn is ONE row.
+    rows = db.get_messages_as_conversation("photon-session")
+    assert [m["role"] for m in rows] == ["user", "assistant", "user", "assistant"]
+
+    # Next turn D (live anchor [spc-D]) walks its own trigger, then the
+    # persisted constituents newest-first, then the prior turn.
+    expectations = ["spc-D", "spc-C", "spc-B", "spc-A", "spc-earlier"]
+    for back, expected in enumerate(expectations):
+        assert resolve_target_message_id(
+            session_id="photon-session",
+            trigger_message_id="spc-D",
+            messages_back=back,
+            db=db,
+            turn_constituents=["spc-D"],
+        ) == (expected, None)
+    assert resolve_target_message_id(
+        session_id="photon-session",
+        trigger_message_id="spc-D",
+        messages_back=len(expectations),
+        db=db,
+        turn_constituents=["spc-D"],
+    )[0] is None
+
+    # Env-fallback path (no live anchor, e.g. post-restart tooling): the
+    # persisted trigger row expands into its constituents too.
+    assert resolve_target_message_id(
+        session_id="photon-session",
+        trigger_message_id="spc-C",
+        messages_back=1,
+        db=db,
+    ) == ("spc-B", None)
+    assert resolve_target_message_id(
+        session_id="photon-session",
+        trigger_message_id="spc-C",
+        messages_back=3,
+        db=db,
+    ) == ("spc-earlier", None)
+    db.close()
+
+
 def test_historical_bubble_without_platform_id_fails_closed(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("photon-session", source="photon")

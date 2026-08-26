@@ -92,6 +92,10 @@ class TurnContext:
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     persist_user_message_id: Optional[str] = None
+    # DB-only sidecar stamped on the persisted user row (e.g. the ordered
+    # constituent provider ids of a debounced multi-bubble turn). Never sent
+    # to the model.
+    persist_user_display_metadata: Optional[dict] = None
     # display_kind stamped on the persisted user row at turn start when this
     # turn was self-injected (MessageEvent.internal), e.g.
     # "internal_notification" for async-delegation/background notifications

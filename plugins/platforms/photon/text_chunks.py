@@ -17,6 +17,26 @@ def _bounded_int(value, default: int, *, minimum: int, maximum: int) -> int:
     return min(maximum, max(minimum, parsed))
 
 
+def _preserve_exact_partition(text: str, proposed: list[str]) -> list[str]:
+    """Project helper-selected boundaries back onto the original byte sequence."""
+    if len(proposed) <= 1:
+        return [text]
+    starts: list[int] = []
+    cursor = 0
+    for chunk in proposed:
+        start = text.find(chunk, cursor)
+        if start < 0:
+            return proposed
+        starts.append(start)
+        cursor = start + len(chunk)
+    if not starts or starts[0] != 0:
+        return proposed
+    return [
+        text[starts[index] : starts[index + 1]]
+        for index in range(len(starts) - 1)
+    ] + [text[starts[-1] :]]
+
+
 def chunk_photon_text(
     text: str,
     *,
@@ -29,23 +49,27 @@ def chunk_photon_text(
     if not text or len(text) <= soft:
         return [text] if text else []
 
-    semantic = split_text_fence_aware(
+    semantic = _preserve_exact_partition(
         text,
-        soft,
-        prefer_paragraphs=True,
-        balance_fences=False,
+        split_text_fence_aware(
+            text,
+            soft,
+            prefer_paragraphs=True,
+            balance_fences=False,
+        ),
     )
     chunks: list[str] = []
     for chunk in semantic:
         if len(chunk) <= hard:
             chunks.append(chunk)
             continue
-        chunks.extend(
-            split_text_fence_aware(
-                chunk,
-                hard,
-                prefer_paragraphs=False,
-                balance_fences=True,
-            )
+        hard_parts = split_text_fence_aware(
+            chunk,
+            hard,
+            prefer_paragraphs=False,
+            balance_fences="```" in chunk,
         )
+        if "```" not in chunk:
+            hard_parts = _preserve_exact_partition(chunk, hard_parts)
+        chunks.extend(hard_parts)
     return [chunk for chunk in chunks if chunk]

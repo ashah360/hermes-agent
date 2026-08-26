@@ -40,7 +40,7 @@ def test_long_text_is_lossless_unlabelled_and_has_no_chunk_count_cap():
 
     assert len(chunks) > 5
     assert all(len(chunk) <= 280 for chunk in chunks)
-    assert "\n\n".join(chunks) == text
+    assert "".join(chunks) == text
     assert not any(re.search(r"\(\d+/\d+\)", chunk) for chunk in chunks)
 
 
@@ -78,7 +78,7 @@ async def test_adapter_submits_all_chunks_as_one_ordered_batch(monkeypatch):
     assert result.success is True
     assert len(calls) == 1
     assert calls[0][0] == "/send-batch"
-    assert "\n\n".join(calls[0][1]["chunks"]) == text
+    assert "".join(calls[0][1]["chunks"]) == text
     assert result.raw_response["part_count"] == len(calls[0][1]["chunks"])
 
 

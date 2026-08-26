@@ -10436,6 +10436,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
+            update_reply_anchor = getattr(
+                adapter, "update_active_turn_reply_anchor", None
+            )
+            if steered and callable(update_reply_anchor):
+                update_reply_anchor(session_key, event)
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"

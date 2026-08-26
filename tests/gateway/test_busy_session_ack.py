@@ -217,6 +217,7 @@ class TestBusySessionAck:
 
         # VERIFY: No queueing — successful steer must NOT replay as next turn
         mock_merge.assert_not_called()
+        adapter.update_active_turn_reply_anchor.assert_called_once_with(sk, event)
 
         # VERIFY: Ack mentions steer wording
         adapter._send_with_retry.assert_called_once()
@@ -287,6 +288,7 @@ class TestBusySessionAck:
         # via the FIFO path (each follow-up its own turn — no newline-merge
         # that would mash separate messages together, #43066).
         assert adapter._pending_messages.get(sk) is event
+        adapter.update_active_turn_reply_anchor.assert_not_called()
 
         # Ack uses queue-mode wording (not steer, not interrupt)
         call_kwargs = adapter._send_with_retry.call_args

@@ -2543,6 +2543,13 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
 
 
 @dataclass
+class _ActiveTurnReplyAnchor:
+    """Mutable per-turn visible-delivery anchor shared with steer ingress."""
+
+    event: MessageEvent
+
+
+@dataclass
 class SendResult:
     """Result of sending a message."""
     success: bool
@@ -3134,6 +3141,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        self._active_turn_reply_anchors: Dict[str, _ActiveTurnReplyAnchor] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
         # construction (gateway/run.py). Default to "interrupt" so a stray
@@ -5941,6 +5949,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
+        getattr(self, "_active_turn_reply_anchors", {}).pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
 
@@ -5960,8 +5969,13 @@ class BasePlatformAdapter(ABC):
         """
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
-
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        reply_anchor_state = _ActiveTurnReplyAnchor(event)
+        self._active_turn_reply_anchors[session_key] = reply_anchor_state
+        task = asyncio.create_task(
+            self._process_message_background(
+                event, session_key, reply_anchor_state=reply_anchor_state
+            )
+        )
         self._session_tasks[session_key] = task
         try:
             self._background_tasks.add(task)
@@ -5969,11 +5983,25 @@ class BasePlatformAdapter(ABC):
             # Tests stub create_task() with lightweight sentinels that are not
             # hashable and do not support lifecycle callbacks.
             self._session_tasks.pop(session_key, None)
+            if self._active_turn_reply_anchors.get(session_key) is reply_anchor_state:
+                self._active_turn_reply_anchors.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
             return False
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+        return True
+
+    def update_active_turn_reply_anchor(
+        self, session_key: str, event: MessageEvent
+    ) -> bool:
+        """Point this active turn's final visible delivery at a successful steer."""
+        if event.internal or not event.message_id:
+            return False
+        state = getattr(self, "_active_turn_reply_anchors", {}).get(session_key)
+        if state is None:
+            return False
+        state.event = event
         return True
 
     async def cancel_session_processing(
@@ -6366,8 +6394,18 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
-    async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+    async def _process_message_background(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        *,
+        reply_anchor_state: Optional[_ActiveTurnReplyAnchor] = None,
+    ) -> None:
         """Background task that actually processes the message."""
+        if reply_anchor_state is None:
+            reply_anchor_state = _ActiveTurnReplyAnchor(event)
+            anchors = self.__dict__.setdefault("_active_turn_reply_anchors", {})
+            anchors[session_key] = reply_anchor_state
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -6534,7 +6572,13 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _delivery_event = reply_anchor_state.event
+                _final_reply_anchor = _reply_anchor_for_event(_delivery_event)
+                _final_thread_metadata = _mark_notify_metadata(
+                    _thread_metadata_for_source(
+                        _delivery_event.source, _final_reply_anchor
+                    )
+                )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -6646,7 +6690,6 @@ class BasePlatformAdapter(ABC):
                         len(text_content),
                         event.source.chat_id,
                     )
-                    _reply_anchor = _reply_anchor_for_event(event)
                     # Delivery-obligation ledger: durably record the final
                     # response BEFORE the send attempt so a gateway crash
                     # between finalize and platform ACK can redeliver it on
@@ -6692,7 +6735,7 @@ class BasePlatformAdapter(ABC):
                     result = await delivery_adapter._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
-                        reply_to=_reply_anchor,
+                        reply_to=_final_reply_anchor,
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
@@ -6929,8 +6972,14 @@ class BasePlatformAdapter(ABC):
                 # exhaust at ~2000 frames and SIGSEGV the process.
                 # Mirror the late-arrival drain pattern below: hand off
                 # to a new task and return so this frame can unwind.
+                drain_reply_anchor = _ActiveTurnReplyAnchor(pending_event)
+                self._active_turn_reply_anchors[session_key] = drain_reply_anchor
                 drain_task = asyncio.create_task(
-                    self._process_message_background(pending_event, session_key)
+                    self._process_message_background(
+                        pending_event,
+                        session_key,
+                        reply_anchor_state=drain_reply_anchor,
+                    )
                 )
                 # Hand ownership of the session to the drain task so
                 # stale-lock detection keeps working while it runs.
@@ -7062,8 +7111,14 @@ class BasePlatformAdapter(ABC):
                     _active = self._active_sessions.get(session_key)
                     if _active is not None:
                         _active.clear()
+                    drain_reply_anchor = _ActiveTurnReplyAnchor(late_pending)
+                    self._active_turn_reply_anchors[session_key] = drain_reply_anchor
                     drain_task = asyncio.create_task(
-                        self._process_message_background(late_pending, session_key)
+                        self._process_message_background(
+                            late_pending,
+                            session_key,
+                            reply_anchor_state=drain_reply_anchor,
+                        )
                     )
                     # Hand ownership of the session to the drain task so stale-lock
                     # detection keeps working while it runs.
@@ -7097,6 +7152,9 @@ class BasePlatformAdapter(ABC):
                 current_task = asyncio.current_task()
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
+            anchors = getattr(self, "_active_turn_reply_anchors", {})
+            if anchors.get(session_key) is reply_anchor_state:
+                anchors.pop(session_key, None)
     
     def _cleanup_finished_session_task(
         self, session_key: str, interrupt_event: Optional[asyncio.Event]

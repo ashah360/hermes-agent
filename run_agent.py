@@ -2356,6 +2356,17 @@ class AIAgent:
                 _batch_rows.append({
                     "role": role,
                     "content": content,
+                    # Provider/platform message identity (e.g. the inbound
+                    # iMessage GUID stamped by build_turn_context from
+                    # persist_user_message_id). The gateway skips its own DB
+                    # write when the agent persists (skip_db=agent_persisted),
+                    # so dropping the key here is what left every user row's
+                    # platform_message_id NULL — breaking exact-message
+                    # actions (Photon trigger/messages_back resolution) and
+                    # the platform-id dedupe guard (#47237).
+                    "platform_message_id": (
+                        msg.get("platform_message_id") or msg.get("message_id")
+                    ),
                     "tool_name": msg.get("tool_name"),
                     "tool_calls": tool_calls_data,
                     "tool_call_id": msg.get("tool_call_id"),

@@ -2,6 +2,84 @@ from hermes_state import SessionDB
 from plugins.platforms.photon.conversation_actions import resolve_target_message_id
 
 
+def _agent_with_db(db, session_id):
+    """Minimal AIAgent stand-in wired to the REAL turn-boundary flush."""
+    import run_agent as ra
+
+    agent = ra.AIAgent.__new__(ra.AIAgent)
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = session_id
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    agent._pending_cli_user_message = None
+    agent._session_persist_lock = None
+    return agent
+
+
+def test_separate_turns_persist_their_own_inbound_ids_through_agent_flush(tmp_path):
+    """Live regression: three successive completed turns all resolved
+    ``target={trigger: true}`` to the FIRST turn's provider id, and every
+    user row in state.db had ``platform_message_id`` NULL.
+
+    The gateway skips its own DB write when the agent persists
+    (``skip_db=agent_persisted``), so the ONLY path that can land the inbound
+    provider id (``persist_user_message_id`` → ``user_msg["message_id"]``,
+    see build_turn_context) in ``platform_message_id`` is the agent's
+    ``_flush_messages_to_session_db``. This walks the real flush once per
+    completed turn — no mid-turn steering — and asserts each turn's trigger
+    resolves to its OWN exact inbound id against the persisted transcript.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("photon-session", source="photon")
+    agent = _agent_with_db(db, "photon-session")
+
+    inbound = [
+        ("spc-msg-88ba9a91", "Ooooooooooooh"),
+        ("spc-msg-2222", "WOW"),
+        ("spc-msg-3333", "HYPE HYPE HYPE"),
+    ]
+    messages = []
+    for provider_id, text in inbound:
+        # Exactly what build_turn_context stages for a gateway turn that
+        # carries persist_user_message_id (commit c96c480186).
+        messages.append({"role": "user", "content": text, "message_id": provider_id})
+        messages.append({"role": "assistant", "content": "!!"})
+        assert agent._flush_messages_to_session_db(messages) is True
+
+        target, error = resolve_target_message_id(
+            session_id="photon-session",
+            trigger_message_id=provider_id,
+            messages_back=0,
+            db=db,
+        )
+        assert (target, error) == (provider_id, None)
+
+    # Every persisted user row carries its own exact inbound provider id —
+    # the incident had all three NULL.
+    rows = db.get_messages_as_conversation("photon-session")
+    persisted = [m.get("message_id") for m in rows if m["role"] == "user"]
+    assert persisted == [provider_id for provider_id, _ in inbound]
+
+    # Relative targeting walks the REAL persisted ids, not the first turn's.
+    assert resolve_target_message_id(
+        session_id="photon-session",
+        trigger_message_id="spc-msg-3333",
+        messages_back=1,
+        db=db,
+    ) == ("spc-msg-2222", None)
+    assert resolve_target_message_id(
+        session_id="photon-session",
+        trigger_message_id="spc-msg-3333",
+        messages_back=2,
+        db=db,
+    ) == ("spc-msg-88ba9a91", None)
+    db.close()
+
+
 def test_resolves_exact_trigger_and_earlier_persisted_user_bubbles(tmp_path):
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)

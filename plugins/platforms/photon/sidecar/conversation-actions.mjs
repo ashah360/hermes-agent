@@ -1,5 +1,19 @@
 import fs from "node:fs/promises";
 
+export function createPerSpaceSerializer() {
+  const tails = new Map();
+  return async function serialize(spaceId, operation) {
+    const previous = tails.get(spaceId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(operation);
+    tails.set(spaceId, current);
+    try {
+      return await current;
+    } finally {
+      if (tails.get(spaceId) === current) tails.delete(spaceId);
+    }
+  };
+}
+
 function requireString(value, name) {
   if (typeof value !== "string" || !value.trim()) {
     throw new TypeError(`${name} must be a non-empty string`);

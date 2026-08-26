@@ -611,6 +611,7 @@ def finalize_turn(
                 session_id=agent.session_id or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
+                turn_id=turn_id,
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:

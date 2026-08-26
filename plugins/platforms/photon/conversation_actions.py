@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 from gateway.session_context import get_session_env
 
 
 TOOL_NAME = "photon_conversation_action"
+_delivered_content_turns: dict[str, bool] = {}
+_delivered_content_lock = threading.Lock()
 
 
 def conversation_actions_configured() -> bool:
@@ -18,9 +21,24 @@ def conversation_actions_configured() -> bool:
 
         config = load_config_readonly() or {}
         gateway = config.get("gateway") or {}
-        platforms = gateway.get("platforms") or {}
-        photon = platforms.get("photon") or {}
-        extra = photon.get("extra") or {}
+        nested_platforms = gateway.get("platforms") or {}
+        top_level_platforms = config.get("platforms") or {}
+        nested_photon = nested_platforms.get("photon") or {}
+        top_level_photon = top_level_platforms.get("photon") or {}
+        nested_extra = (
+            nested_photon.get("extra", {})
+            if isinstance(nested_photon, dict)
+            else {}
+        )
+        top_level_extra = (
+            top_level_photon.get("extra", {})
+            if isinstance(top_level_photon, dict)
+            else {}
+        )
+        extra = {
+            **(nested_extra if isinstance(nested_extra, dict) else {}),
+            **(top_level_extra if isinstance(top_level_extra, dict) else {}),
+        }
         return extra.get("conversation_actions_enabled") is True
     except Exception:
         return False
@@ -36,10 +54,41 @@ def _receipt(action: str, **fields: Any) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def _set_content_delivery_policy(turn_id: str, allow_follow_up: bool) -> None:
+    if not turn_id:
+        return
+    with _delivered_content_lock:
+        if allow_follow_up:
+            _delivered_content_turns.pop(turn_id, None)
+        else:
+            _delivered_content_turns.pop(turn_id, None)
+            _delivered_content_turns[turn_id] = True
+            while len(_delivered_content_turns) > 1024:
+                _delivered_content_turns.pop(next(iter(_delivered_content_turns)))
+
+
+def suppress_redundant_final(
+    response_text: str,
+    platform: str = "",
+    turn_id: str = "",
+    **_: Any,
+) -> Optional[str]:
+    """Consume a content-action delivery marker at the generic output seam."""
+    if str(platform).strip().lower() != "photon" or not turn_id:
+        return None
+    with _delivered_content_lock:
+        suppress = _delivered_content_turns.pop(turn_id, False)
+        if not suppress:
+            return None
+    return "[SILENT]"
+
+
 def _validate_request(args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], int]:
     action = str(args.get("action") or "").strip()
     if action not in {"react", "unreact", "reply", "present_images"}:
         return None, "action must be react, unreact, reply, or present_images", 0
+    if action in {"react", "unreact"} and "allow_follow_up" in args:
+        return None, f"{action} does not accept allow_follow_up", 0
 
     target = args.get("target")
     if action == "present_images":
@@ -52,6 +101,8 @@ def _validate_request(args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str
             return None, "every image path must be a non-empty string", 0
         if args.get("emoji") or args.get("text"):
             return None, "present_images accepts only images and an optional caption", 0
+        if not isinstance(args.get("allow_follow_up", False), bool):
+            return None, "allow_follow_up must be a boolean", 0
         return action, None, 0
 
     if not isinstance(target, dict):
@@ -82,6 +133,8 @@ def _validate_request(args: Dict[str, Any]) -> Tuple[Optional[str], Optional[str
             return None, "reply requires non-empty text", 0
         if args.get("emoji") or args.get("images") or args.get("caption"):
             return None, "reply accepts only target and text", 0
+        if not isinstance(args.get("allow_follow_up", False), bool):
+            return None, "allow_follow_up must be a boolean", 0
     return action, None, back
 
 
@@ -215,6 +268,12 @@ async def conversation_action_tool(args: Dict[str, Any], **kwargs: Any) -> str:
     if not bool(getattr(adapter, "is_connected", False)):
         return _error("adapter_disconnected", "the Photon adapter is not connected")
 
+    session_id = _resolve_session_id(
+        runner,
+        str(kwargs.get("session_id") or ""),
+        session_key,
+    )
+    turn_id = str(kwargs.get("turn_id") or "")
     if action == "present_images":
         result = await adapter.send_image_group(
             chat_id,
@@ -224,6 +283,9 @@ async def conversation_action_tool(args: Dict[str, Any], **kwargs: Any) -> str:
         if not result.success:
             return _error("action_failed", result.error or "image group failed")
         raw = result.raw_response or {}
+        _set_content_delivery_policy(
+            turn_id, bool(args.get("allow_follow_up", False))
+        )
         return _receipt(
             action,
             sent_message_ids=[
@@ -235,11 +297,6 @@ async def conversation_action_tool(args: Dict[str, Any], **kwargs: Any) -> str:
         )
 
     trigger_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
-    session_id = _resolve_session_id(
-        runner,
-        str(kwargs.get("session_id") or ""),
-        session_key,
-    )
     target_id, target_error = resolve_target_message_id(
         session_id=session_id,
         trigger_message_id=trigger_id,
@@ -286,6 +343,9 @@ async def conversation_action_tool(args: Dict[str, Any], **kwargs: Any) -> str:
         )
     raw = result.raw_response or {}
     message_ids = list(raw.get("message_ids") or [result.message_id])
+    _set_content_delivery_policy(
+        turn_id, bool(args.get("allow_follow_up", False))
+    )
     return _receipt(
         action,
         target_message_id=target_id,

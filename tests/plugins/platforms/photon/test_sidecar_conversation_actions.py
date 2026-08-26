@@ -19,6 +19,7 @@ def test_sidecar_exact_targets_replies_reactions_and_atomic_groups(tmp_path):
         f"""
 import assert from "node:assert/strict";
 import {{
+  createPerSpaceSerializer,
   resolveMessageTarget,
   setExactReaction,
   sendExactReply,
@@ -158,6 +159,42 @@ const ordered = await sendTextBatch({{
 assert.deepEqual(started, ["first", "second", "third"]);
 assert.deepEqual(ordered.messageIds, ["text-0", "text-1", "text-2"]);
 assert.equal(ordered.complete, true);
+
+const serialize = createPerSpaceSerializer();
+const concurrencyEvents = [];
+let releaseFirstChunk;
+let announceFirstChunk;
+const firstChunkEntered = new Promise((resolve) => {{ announceFirstChunk = resolve; }});
+const firstChunkGate = new Promise((resolve) => {{ releaseFirstChunk = resolve; }});
+const serializedSpace = {{
+  async send(content) {{
+    concurrencyEvents.push(content);
+    if (content === "batch-first") {{
+      announceFirstChunk();
+      await firstChunkGate;
+    }}
+    return {{ id: `serialized-${{content}}` }};
+  }},
+}};
+const batchA = serialize("same-space", () => sendTextBatch({{
+  space: serializedSpace,
+  chunks: ["batch-first", "batch-second"],
+  buildContent: (chunk) => chunk,
+}}));
+await firstChunkEntered;
+const operationB = serialize("same-space", () => serializedSpace.send("operation-b"));
+const otherSpace = serialize("other-space", async () => {{
+  concurrencyEvents.push("other-space");
+  return "other";
+}});
+assert.equal(await otherSpace, "other");
+assert.deepEqual(concurrencyEvents, ["batch-first", "other-space"]);
+releaseFirstChunk();
+await Promise.all([batchA, operationB]);
+assert.deepEqual(
+  concurrencyEvents,
+  ["batch-first", "other-space", "batch-second", "operation-b"],
+);
 
 let attempts = 0;
 const partial = await sendTextBatch({{

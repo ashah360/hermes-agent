@@ -59,6 +59,55 @@ def test_gateway_toolset_resolution_scopes_action_to_photon():
     assert "hermes-photon" not in _get_platform_tools(config, "telegram")
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            {
+                "platforms": {
+                    "photon": {"extra": {"conversation_actions_enabled": True}}
+                }
+            },
+            True,
+        ),
+        (
+            {
+                "gateway": {
+                    "platforms": {
+                        "photon": {
+                            "extra": {"conversation_actions_enabled": True}
+                        }
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            {
+                "platforms": {
+                    "photon": {"extra": {"conversation_actions_enabled": False}}
+                },
+                "gateway": {
+                    "platforms": {
+                        "photon": {
+                            "extra": {"conversation_actions_enabled": True}
+                        }
+                    }
+                },
+            },
+            False,
+        ),
+    ],
+)
+def test_config_gate_matches_gateway_platform_precedence(
+    monkeypatch, config, expected
+):
+    import hermes_cli.config
+
+    monkeypatch.setattr(hermes_cli.config, "load_config_readonly", lambda: config)
+    assert actions.conversation_actions_configured() is expected
+
+
 @pytest.mark.asyncio
 async def test_action_derives_current_chat_and_resolves_earlier_exact_target(
     monkeypatch,
@@ -154,6 +203,117 @@ async def test_reply_and_images_return_redacted_native_receipts(monkeypatch):
     serialized = json.dumps(images)
     assert "current-chat" not in serialized
     assert "/private/" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_content_actions_suppress_final_unless_follow_up_is_explicit(
+    monkeypatch,
+):
+    adapter = _Adapter()
+    monkeypatch.setattr(
+        actions,
+        "_resolve_runtime",
+        lambda: (object(), adapter, "current-chat", "session-key"),
+    )
+    monkeypatch.setattr(actions, "_resolve_session_id", lambda *_args: "session-id")
+    monkeypatch.setattr(
+        actions,
+        "resolve_target_message_id",
+        lambda **kwargs: ("target-guid", None),
+    )
+    monkeypatch.setattr(
+        actions,
+        "get_session_env",
+        lambda name, default="": (
+            "trigger-guid" if name == "HERMES_SESSION_MESSAGE_ID" else default
+        ),
+    )
+
+    await actions.conversation_action_tool(
+        {
+            "action": "reply",
+            "target": {"trigger": True},
+            "text": "already delivered",
+        },
+        session_id="session-id",
+        turn_id="turn-content",
+    )
+    assert (
+        actions.suppress_redundant_final(
+            "ceremonial duplicate",
+            platform="photon",
+            turn_id="turn-content",
+        )
+        == "[SILENT]"
+    )
+    # The marker is one-turn state and cannot suppress a later response.
+    assert (
+        actions.suppress_redundant_final(
+            "later turn",
+            platform="photon",
+            turn_id="turn-later",
+        )
+        is None
+    )
+
+    await actions.conversation_action_tool(
+        {
+            "action": "present_images",
+            "images": ["/private/one.png", "/private/two.png"],
+            "allow_follow_up": True,
+        },
+        session_id="session-id",
+        turn_id="turn-follow-up",
+    )
+    assert (
+        actions.suppress_redundant_final(
+            "useful additional context",
+            platform="photon",
+            turn_id="turn-follow-up",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_reactions_never_suppress_normal_final(monkeypatch):
+    adapter = _Adapter()
+    monkeypatch.setattr(
+        actions,
+        "_resolve_runtime",
+        lambda: (object(), adapter, "current-chat", "session-key"),
+    )
+    monkeypatch.setattr(actions, "_resolve_session_id", lambda *_args: "reaction-session")
+    monkeypatch.setattr(
+        actions,
+        "resolve_target_message_id",
+        lambda **kwargs: ("target-guid", None),
+    )
+    monkeypatch.setattr(
+        actions,
+        "get_session_env",
+        lambda name, default="": (
+            "trigger-guid" if name == "HERMES_SESSION_MESSAGE_ID" else default
+        ),
+    )
+
+    await actions.conversation_action_tool(
+        {
+            "action": "react",
+            "target": {"trigger": True},
+            "emoji": "❤️",
+        },
+        session_id="reaction-session",
+        turn_id="turn-reaction",
+    )
+    assert (
+        actions.suppress_redundant_final(
+            "normal response",
+            platform="photon",
+            turn_id="turn-reaction",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

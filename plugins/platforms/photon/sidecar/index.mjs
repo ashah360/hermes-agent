@@ -79,6 +79,7 @@ import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
 import {
+  createPerSpaceSerializer,
   setExactReaction,
   sendExactReply,
   sendImageGroup,
@@ -376,6 +377,7 @@ const knownMessages = new Map();
 // is the outbound reaction Message returned by `target.react()`, kept so
 // /unreact can `unsend()` it later.
 const reactionHandles = new Map();
+const serializeVisibleOutbound = createPerSpaceSerializer();
 
 function lruSet(map, key, value, cap) {
   if (map.has(key)) map.delete(key);
@@ -1045,21 +1047,23 @@ const server = http.createServer(async (req, res) => {
       if (format !== "text" && format !== "markdown") {
         return badRequest(res, "format must be text or markdown");
       }
-      const space = await resolveSpace(spaceId);
-      // iMessage renders markdown natively; spectrum-ts degrades it to
-      // readable plain text on platforms that don't.
-      // spectrumMarkdown() enables enableDataDetection in the underlying
-      // iMessage API, which can 500 on messages containing raw URLs.
-      // Plain-text URLs are auto-linked by iMessage, so route markdown
-      // messages that contain URLs through spectrumText while preserving
-      // spectrumMarkdown for URL-free markdown. The decision lives in
-      // send-format.mjs so tests can exercise it directly.
-      const builder =
-        chooseSendFormat(format, text) === "markdown"
-          ? spectrumMarkdown(text)
-          : spectrumText(text);
-      const result = await space.send(builder);
-      return ok(res, { messageId: result?.id || null });
+      return serializeVisibleOutbound(spaceId, async () => {
+        const space = await resolveSpace(spaceId);
+        // iMessage renders markdown natively; spectrum-ts degrades it to
+        // readable plain text on platforms that don't.
+        // spectrumMarkdown() enables enableDataDetection in the underlying
+        // iMessage API, which can 500 on messages containing raw URLs.
+        // Plain-text URLs are auto-linked by iMessage, so route markdown
+        // messages that contain URLs through spectrumText while preserving
+        // spectrumMarkdown for URL-free markdown. The decision lives in
+        // send-format.mjs so tests can exercise it directly.
+        const builder =
+          chooseSendFormat(format, text) === "markdown"
+            ? spectrumMarkdown(text)
+            : spectrumText(text);
+        const result = await space.send(builder);
+        return ok(res, { messageId: result?.id || null });
+      });
     }
     if (req.url === "/send-batch") {
       const { spaceId, chunks, format = "text" } = body || {};
@@ -1080,25 +1084,29 @@ const server = http.createServer(async (req, res) => {
       if (format !== "text" && format !== "markdown") {
         return badRequest(res, "format must be text or markdown");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await sendTextBatch({
-        space,
-        chunks,
-        buildContent: (chunk) =>
-          chooseSendFormat(format, chunk) === "markdown"
-            ? spectrumMarkdown(chunk)
-            : spectrumText(chunk),
+      return serializeVisibleOutbound(spaceId, async () => {
+        const space = await resolveSpace(spaceId);
+        const result = await sendTextBatch({
+          space,
+          chunks,
+          buildContent: (chunk) =>
+            chooseSendFormat(format, chunk) === "markdown"
+              ? spectrumMarkdown(chunk)
+              : spectrumText(chunk),
+        });
+        return ok(res, result);
       });
-      return ok(res, result);
     }
     if (req.url === "/send-richlink") {
       const { spaceId, url } = body || {};
       if (!spaceId || !isHttpUrl(url)) {
         return badRequest(res, "spaceId and http(s) url are required");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await space.send(spectrumRichlink(url.trim()));
-      return ok(res, { messageId: result?.id || null });
+      return serializeVisibleOutbound(spaceId, async () => {
+        const space = await resolveSpace(spaceId);
+        const result = await space.send(spectrumRichlink(url.trim()));
+        return ok(res, { messageId: result?.id || null });
+      });
     }
     if (req.url === "/send-attachment") {
       const { spaceId, path, name, mimeType, caption, kind } =
@@ -1106,55 +1114,59 @@ const server = http.createServer(async (req, res) => {
       if (!spaceId || typeof path !== "string" || !path) {
         return badRequest(res, "spaceId and path are required");
       }
-      const space = await resolveSpace(spaceId);
+      return serializeVisibleOutbound(spaceId, async () => {
+        const space = await resolveSpace(spaceId);
 
-      // spectrum-ts infers name + MIME from the file extension; pass
-      // overrides only when Hermes supplied them so a known-good
-      // inference isn't clobbered with an empty string.
-      const opts = {};
-      if (name) opts.name = name;
-      if (mimeType) opts.mimeType = mimeType;
-      const builder =
-        kind === "voice"
-          ? voice(path, Object.keys(opts).length ? opts : undefined)
-          : attachment(path, Object.keys(opts).length ? opts : undefined);
+        // spectrum-ts infers name + MIME from the file extension; pass
+        // overrides only when Hermes supplied them so a known-good
+        // inference isn't clobbered with an empty string.
+        const opts = {};
+        if (name) opts.name = name;
+        if (mimeType) opts.mimeType = mimeType;
+        const builder =
+          kind === "voice"
+            ? voice(path, Object.keys(opts).length ? opts : undefined)
+            : attachment(path, Object.keys(opts).length ? opts : undefined);
 
-      const result = await space.send(builder);
+        const result = await space.send(builder);
 
-      // iMessage delivers the caption as a separate bubble; send it
-      // after the media so the attachment renders first.
-      if (caption && typeof caption === "string") {
-        try {
-          await space.send(spectrumText(caption));
-        } catch (e) {
-          console.error(
-            "photon-sidecar: attachment sent but caption failed: " +
-              (e && e.stack ? e.stack : String(e))
-          );
+        // iMessage delivers the caption as a separate bubble; send it
+        // after the media so the attachment renders first.
+        if (caption && typeof caption === "string") {
+          try {
+            await space.send(spectrumText(caption));
+          } catch (e) {
+            console.error(
+              "photon-sidecar: attachment sent but caption failed: " +
+                (e && e.stack ? e.stack : String(e))
+            );
+          }
         }
-      }
-      return ok(res, { messageId: result?.id || null });
+        return ok(res, { messageId: result?.id || null });
+      });
     }
     if (req.url === "/reply") {
       const { spaceId, messageId, items } = body || {};
       if (!spaceId || !messageId || !Array.isArray(items) || items.length === 0) {
         return badRequest(res, "spaceId, messageId and reply items are required");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await sendExactReply({
-        space,
-        messageId,
-        knownMessages,
-        items,
-        text: spectrumText,
-        attachment,
-      });
-      if (!result.found) {
-        return badRequest(res, "message target not found", "target_not_found");
-      }
-      return ok(res, {
-        messageIds: result.messageIds,
-        targetSource: result.source,
+      return serializeVisibleOutbound(spaceId, async () => {
+        const space = await resolveSpace(spaceId);
+        const result = await sendExactReply({
+          space,
+          messageId,
+          knownMessages,
+          items,
+          text: spectrumText,
+          attachment,
+        });
+        if (!result.found) {
+          return badRequest(res, "message target not found", "target_not_found");
+        }
+        return ok(res, {
+          messageIds: result.messageIds,
+          targetSource: result.source,
+        });
       });
     }
     if (req.url === "/send-group") {
@@ -1165,16 +1177,18 @@ const server = http.createServer(async (req, res) => {
       if (images.length < 2 || images.length > 5) {
         return badRequest(res, "image groups require 2 to 5 images");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await sendImageGroup({
-        space,
-        images,
-        caption,
-        attachment,
-        text: spectrumText,
-        group: spectrumGroup,
+      return serializeVisibleOutbound(spaceId, async () => {
+        const space = await resolveSpace(spaceId);
+        const result = await sendImageGroup({
+          space,
+          images,
+          caption,
+          attachment,
+          text: spectrumText,
+          group: spectrumGroup,
+        });
+        return ok(res, result);
       });
-      return ok(res, result);
     }
     if (req.url === "/react") {
       const { spaceId, messageId, emoji } = body || {};
@@ -1246,9 +1260,11 @@ const server = http.createServer(async (req, res) => {
       if (choices.length < 2) {
         return badRequest(res, "options must contain at least two choices");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await space.send(spectrumPoll(title.trim(), choices));
-      return ok(res, { messageId: result?.id || null });
+      return serializeVisibleOutbound(spaceId, async () => {
+        const space = await resolveSpace(spaceId);
+        const result = await space.send(spectrumPoll(title.trim(), choices));
+        return ok(res, { messageId: result?.id || null });
+      });
     }
     if (req.url === "/send-effect") {
       const { spaceId, text, effect } = body || {};
@@ -1260,11 +1276,13 @@ const server = http.createServer(async (req, res) => {
       if (!effectId) {
         return badRequest(res, "unsupported effect");
       }
-      const space = await resolveSpace(spaceId);
-      const result = await space.send(
-        imessageEffect(spectrumText(text.trim()), effectId)
-      );
-      return ok(res, { messageId: result?.id || null });
+      return serializeVisibleOutbound(spaceId, async () => {
+        const space = await resolveSpace(spaceId);
+        const result = await space.send(
+          imessageEffect(spectrumText(text.trim()), effectId)
+        );
+        return ok(res, { messageId: result?.id || null });
+      });
     }
     if (req.url === "/typing") {
       const { spaceId, state = "start" } = body || {};

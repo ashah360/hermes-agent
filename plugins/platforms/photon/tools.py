@@ -17,7 +17,9 @@ CONVERSATION_ACTION_SCHEMA = {
         "a true threaded reply when context matters, or present 2–5 useful images as "
         "one ordered stack. Reactions are occasional social punctuation, never status "
         "signals; they may be the whole response when sufficient. Do not narrate an "
-        "action or decorate every turn. This tool cannot address another chat."
+        "action or decorate every turn. Reply/image content is the final response by "
+        "default; set allow_follow_up only when a separate top-level message adds "
+        "genuinely useful content. This tool cannot address another chat."
     ),
     "parameters": {
         "type": "object",
@@ -67,6 +69,14 @@ CONVERSATION_ACTION_SCHEMA = {
             "caption": {
                 "type": "string",
                 "description": "Optional short caption placed after the image stack.",
+            },
+            "allow_follow_up": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "For reply or present_images only. Set true only when a separate "
+                    "top-level final message will add useful, non-duplicate content."
+                ),
             },
         },
         "required": ["action"],

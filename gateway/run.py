@@ -10441,11 +10441,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
-            update_reply_anchor = getattr(
-                adapter, "update_active_turn_reply_anchor", None
-            )
-            if steered and callable(update_reply_anchor):
-                update_reply_anchor(session_key, event)
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
@@ -10464,6 +10459,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                 redirected = False
+
+        # Hard OOB-injection invariant: EVERY payload accepted into the
+        # RUNNING turn — a successful steer OR a successful interrupt-mode
+        # redirect — becomes the active turn's latest addressable bubble
+        # here, synchronously, before this coroutine yields. steer()/
+        # redirect() only QUEUE the text (the agent loop injects it at its
+        # next boundary), so the anchor is current before the model can see
+        # the message and react to it via a conversation action. The
+        # redirect lane previously skipped this update, so an out-of-band
+        # bubble was visible to the model while trigger still resolved the
+        # pre-steer bubble. Failed/queued payloads never reach this call.
+        if steered or redirected:
+            update_reply_anchor = getattr(
+                adapter, "update_active_turn_reply_anchor", None
+            )
+            if callable(update_reply_anchor):
+                update_reply_anchor(session_key, event)
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a

@@ -266,6 +266,62 @@ class TestBusySessionAck:
 
 
     @pytest.mark.asyncio
+    async def test_redirect_mode_updates_active_turn_reply_anchor(self, monkeypatch):
+        """A successful interrupt-mode redirect is an OOB injection into the
+        RUNNING turn, exactly like a steer — it must retarget the active-turn
+        anchor so conversation actions resolve the redirected bubble as the
+        latest trigger (live regression: reaction landed on the pre-steer
+        bubble)."""
+        import gateway.run as _gr
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+
+        event = _make_event(text="In succession")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = True
+        agent.redirect = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        agent.redirect.assert_called_once_with("In succession")
+        agent.interrupt.assert_not_called()
+        adapter.update_active_turn_reply_anchor.assert_called_once_with(sk, event)
+        # Successful redirect must not replay as a next-turn message.
+        assert sk not in adapter._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_failed_redirect_does_not_touch_anchor(self, monkeypatch):
+        """A redirect the agent rejects falls through to interrupt semantics
+        and must never become an addressable anchor."""
+        import gateway.run as _gr
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+
+        event = _make_event(text="rejected redirect")
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent._supports_active_turn_redirect = True
+        agent.redirect = MagicMock(return_value=False)
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        agent.redirect.assert_called_once()
+        adapter.update_active_turn_reply_anchor.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_steer_mode_falls_back_to_queue_when_agent_rejects(self):
         """If agent.steer() returns False, fall back to queue behavior."""
         runner, sentinel = _make_runner()

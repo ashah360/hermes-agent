@@ -582,6 +582,122 @@ async def test_debounced_bubbles_stay_individually_addressable(
 
 
 @pytest.mark.asyncio
+async def test_oob_steer_accepted_mid_tool_call_owns_next_trigger(monkeypatch):
+    """Live race on 59b5ec5e97: active turn A/B was mid-tool-call when a new
+    real inbound bubble C was accepted as an out-of-band steer and appended
+    to the running agent context; the immediately following
+    target={trigger: true} still resolved B. Hard invariant: the moment the
+    gateway accepts an OOB payload into the running turn (REAL busy-steer
+    path), the live anchor already names C — before the blocked model/tool
+    step is even released — so the next conversation action resolves C.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+
+    adapter = _AnchorAdapter()
+
+    # Active turn: debounced A/B (two distinct provider bubbles, one turn).
+    turn_event = _anchor_event("spc-A")
+    turn_event.text = "I’m sending\nA bunch"
+    from gateway.platforms.base import ConstituentMessage
+
+    turn_event.constituent_messages = [
+        ConstituentMessage(text="I’m sending", message_id="spc-A"),
+        ConstituentMessage(text="A bunch", message_id="spc-B"),
+    ]
+    turn_event.message_id = "spc-B"
+    session_key = build_session_key(turn_event.source)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_event):
+        entered.set()
+        await release.wait()  # the blocked model/tool step
+        return "final"
+
+    adapter.set_message_handler(handler)
+    assert adapter._start_session_processing(turn_event, session_key)
+    await entered.wait()
+    assert adapter.active_turn_constituent_message_ids(session_key) == [
+        "spc-A",
+        "spc-B",
+    ]
+
+    # Real busy-steer ingress (gateway runner), agent still blocked.
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._busy_ack_ts = {}
+    runner._draining = False
+    runner._busy_input_mode = "steer"
+    runner._busy_text_mode = "steer"
+    runner.adapters = {}
+    runner.config = MagicMock()
+    runner.config.group_sessions_per_user = True
+    runner.config.thread_sessions_per_user = False
+    runner.session_store = None
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner._is_user_authorized = lambda _source: True
+    runner._adapter_for_source = lambda _source: adapter
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+
+    running_agent = MagicMock()
+    running_agent.steer = MagicMock(return_value=True)
+    runner._running_agents[session_key] = running_agent
+
+    event_c = _anchor_event("spc-C")
+    event_c.text = "In succession"
+    handled = await runner._handle_active_session_busy_message(
+        event_c, session_key
+    )
+    assert handled is True
+    running_agent.steer.assert_called_once_with("In succession")
+
+    # The invariant: BEFORE the blocked step is released, the anchor already
+    # names C as the latest addressable bubble.
+    assert adapter.active_turn_constituent_message_ids(session_key) == [
+        "spc-A",
+        "spc-B",
+        "spc-C",
+    ]
+
+    monkeypatch.setattr(
+        actions,
+        "_resolve_runtime",
+        lambda: (object(), adapter, "chat-1", session_key),
+    )
+    monkeypatch.setattr(actions, "_resolve_session_id", lambda *_args: "session-id")
+    monkeypatch.setattr(
+        actions,
+        "get_session_env",
+        lambda name, default="": (
+            "spc-B" if name == "HERMES_SESSION_MESSAGE_ID" else default
+        ),
+    )
+
+    async def _target(spec):
+        return json.loads(
+            await actions.conversation_action_tool(
+                {"action": "react", "target": spec, "emoji": "3️⃣"}
+            )
+        )["target_message_id"]
+
+    # The next action after the OOB message resolves it as the trigger; the
+    # pre-steer bubbles remain addressable behind it.
+    assert await _target({"trigger": True}) == "spc-C"
+    assert await _target({"messages_back": 1}) == "spc-B"
+    assert await _target({"messages_back": 2}) == "spc-A"
+
+    release.set()
+    await adapter._session_tasks[session_key]
+
+
+@pytest.mark.asyncio
 async def test_non_photon_context_fails_without_dispatch(monkeypatch):
     monkeypatch.setattr(actions, "_resolve_runtime", lambda: (None, None, "", ""))
 

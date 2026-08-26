@@ -5970,7 +5970,11 @@ class BasePlatformAdapter(ABC):
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
         reply_anchor_state = _ActiveTurnReplyAnchor(event)
-        self._active_turn_reply_anchors[session_key] = reply_anchor_state
+        # setdefault: duck-typed test adapters skip __init__ (same pattern as
+        # _process_message_background's fallback below).
+        self.__dict__.setdefault("_active_turn_reply_anchors", {})[
+            session_key
+        ] = reply_anchor_state
         task = asyncio.create_task(
             self._process_message_background(
                 event, session_key, reply_anchor_state=reply_anchor_state

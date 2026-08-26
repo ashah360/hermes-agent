@@ -464,6 +464,7 @@ def build_turn_context(
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
     *,
+    persist_user_message_id: Optional[str] = None,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     restore_or_build_system_prompt,
@@ -682,6 +683,12 @@ def build_turn_context(
     # CLI input is stamped when staged. Gateway input may carry the platform
     # event time. Preserve either value and cover any legacy unstamped handoff.
     stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
+    if persist_user_message_id:
+        user_msg["message_id"] = str(persist_user_message_id)
+    else:
+        # A reused/staged dict must never lend a prior platform id to a
+        # synthetic or otherwise unanchored turn.
+        user_msg.pop("message_id", None)
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():

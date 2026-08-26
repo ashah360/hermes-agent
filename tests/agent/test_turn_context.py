@@ -218,6 +218,21 @@ def test_user_message_preserves_platform_event_timestamp():
     assert ctx.messages[-1]["timestamp"] == 123.5
 
 
+def test_user_message_persists_provider_id_without_stale_inheritance():
+    agent = _FakeAgent()
+    ctx = _build(agent, persist_user_message_id="provider-msg-1")
+    assert ctx.messages[-1]["message_id"] == "provider-msg-1"
+
+    next_agent = _FakeAgent()
+    next_agent._pending_cli_user_message = {
+        "role": "user",
+        "content": "hello",
+        "message_id": "stale-msg",
+    }
+    next_ctx = _build(next_agent)
+    assert "message_id" not in next_ctx.messages[-1]
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous

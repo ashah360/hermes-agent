@@ -6413,6 +6413,10 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.persist_user_message_id:
+                _conversation_kwargs["persist_user_message_id"] = (
+                    ctx.persist_user_message_id
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -19215,6 +19219,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_key": session_key,
             })
         
+        # Bind volatile provider identity to a per-turn source copy. Adapters
+        # often reuse a routing-only SessionSource across events; mutating it
+        # would let a later synthetic event inherit the previous message id.
+        source = dataclasses.replace(
+            source,
+            message_id=str(event.message_id) if event.message_id else None,
+        )
+
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
@@ -20430,6 +20442,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=source.message_id,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
             )
@@ -20872,22 +20885,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
                 if persist_user_display_kind:
                     _user_entry["display_kind"] = persist_user_display_kind
-                if event.message_id:
-                    _user_entry["message_id"] = str(event.message_id)
+                if source.message_id:
+                    _user_entry["message_id"] = str(source.message_id)
                 # Dedupe: skip if this platform message_id is already in the
                 # transcript (prevents duplicate user turns on Telegram retries
                 # after transient failures). #47237
                 _skip_persist = (
-                    event.message_id
+                    source.message_id
                     and await self.async_session_store.has_platform_message_id(
-                        session_entry.session_id, str(event.message_id)
+                        session_entry.session_id, str(source.message_id)
                     )
                 )
                 if _skip_persist:
                     logger.info(
                         "Skipping duplicate user turn "
                         "(message_id=%s) in session %s",
-                        event.message_id, session_entry.session_id,
+                        source.message_id, session_entry.session_id,
                     )
                 else:
                     await self.async_session_store.append_to_transcript(
@@ -20916,8 +20929,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
                     if persist_user_display_kind:
                         _user_entry["display_kind"] = persist_user_display_kind
-                    if event.message_id:
-                        _user_entry["message_id"] = str(event.message_id)
+                    if source.message_id:
+                        _user_entry["message_id"] = str(source.message_id)
                     await self.async_session_store.append_to_transcript(
                         session_entry.session_id,
                         _user_entry,
@@ -20944,10 +20957,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if (
                             not _user_msg_id_attached
                             and msg.get("role") == "user"
-                            and event.message_id
+                            and source.message_id
                             and "message_id" not in entry
                         ):
-                            entry["message_id"] = str(event.message_id)
+                            entry["message_id"] = str(source.message_id)
                             _user_msg_id_attached = True
                         await self.async_session_store.append_to_transcript(
                             session_entry.session_id, entry,
@@ -21115,8 +21128,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         }
                         if 'persist_user_display_kind' in locals() and persist_user_display_kind:
                             _user_entry["display_kind"] = persist_user_display_kind
-                        if getattr(event, "message_id", None):
-                            _user_entry["message_id"] = str(event.message_id)
+                        if getattr(source, "message_id", None):
+                            _user_entry["message_id"] = str(source.message_id)
                         await self.async_session_store.append_to_transcript(
                             session_entry.session_id,
                             _user_entry,
@@ -28154,6 +28167,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        persist_user_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28172,6 +28186,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=persist_user_message_id,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
@@ -28185,6 +28200,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_message_id=persist_user_message_id,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
@@ -28330,6 +28346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        persist_user_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28638,6 +28655,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persist_user_message_id=persist_user_message_id,
             persist_user_display_kind=persist_user_display_kind,
         )
         turn_runner = TurnRunner(self, turn_ctx)

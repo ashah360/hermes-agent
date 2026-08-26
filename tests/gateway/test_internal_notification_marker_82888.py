@@ -158,6 +158,69 @@ async def test_real_user_event_gets_no_marker(monkeypatch, tmp_path):
     assert kwargs["persist_user_display_kind"] is None
 
 
+@pytest.mark.asyncio
+async def test_event_message_id_is_bound_per_turn_and_forwarded_to_persistence(
+    monkeypatch, tmp_path
+):
+    from gateway.session_context import get_session_env
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._set_session_env = gateway_run.GatewayRunner._set_session_env.__get__(
+        runner, gateway_run.GatewayRunner
+    )
+    runner._clear_session_env = gateway_run.GatewayRunner._clear_session_env.__get__(
+        runner, gateway_run.GatewayRunner
+    )
+    observed = []
+
+    async def run_agent(**kwargs):
+        observed.append(
+            (
+                get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
+                kwargs["source"].message_id,
+                kwargs.get("persist_user_message_id"),
+            )
+        )
+        return {
+            "final_response": "ack",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+
+    runner._run_agent = AsyncMock(side_effect=run_agent)
+    shared_source = _source()
+
+    await runner._handle_message_with_agent(
+        MessageEvent(
+            text="anchored",
+            source=shared_source,
+            message_id="provider-msg-1",
+        ),
+        shared_source,
+        SESSION_KEY,
+        1,
+    )
+    await runner._handle_message_with_agent(
+        MessageEvent(
+            text="[SYNTHETIC]",
+            source=shared_source,
+            message_id=None,
+            internal=True,
+        ),
+        shared_source,
+        SESSION_KEY,
+        2,
+    )
+
+    assert observed == [
+        ("provider-msg-1", "provider-msg-1", "provider-msg-1"),
+        ("", None, None),
+    ]
+    assert shared_source.message_id is None
+
+
 # ── 3: gateway-side fallback rows carry the marker for internal events ─────
 
 

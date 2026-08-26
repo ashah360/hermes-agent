@@ -1831,6 +1831,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    persist_user_message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1848,6 +1849,8 @@ def run_conversation(
             synthetic prefixes.
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
+        persist_user_message_id: Optional provider message identifier to store
+            on the persisted user row for exact-message actions.
         persist_user_display_kind: Optional presentation type for a
             synthesized user turn (``auto_continue``, ``model_switch``, …).
             Display-only: transcript surfaces render the row as a timeline
@@ -1905,6 +1908,7 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        persist_user_message_id=persist_user_message_id,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,

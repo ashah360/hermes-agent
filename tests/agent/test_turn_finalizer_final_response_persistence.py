@@ -130,6 +130,46 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == result["messages"][-1]
 
 
+def test_transformed_final_is_returned_and_persisted(monkeypatch):
+    """The durable assistant row must match the post-transform response."""
+    post_llm_responses = []
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return ["[SILENT]", "must-not-run"]
+        if name == "post_llm_call":
+            post_llm_responses.append(kwargs["assistant_response"])
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    agent.platform = "photon"
+    messages = [{"role": "user", "content": "show me"}]
+
+    result = finalize_turn(
+        agent,
+        final_response="Ceremonial duplicate.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn-transform",
+        user_message="show me",
+        original_user_message="show me",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["final_response"] == "[SILENT]"
+    assert result["response_transformed"] is True
+    assert result["pre_transform_response"] == "Ceremonial duplicate."
+    assert agent.persisted_messages[-1]["content"] == "[SILENT]"
+    assert result["messages"][-1]["content"] == "[SILENT]"
+    assert post_llm_responses == ["[SILENT]"]
+
+
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(
     monkeypatch, tmp_path
 ):

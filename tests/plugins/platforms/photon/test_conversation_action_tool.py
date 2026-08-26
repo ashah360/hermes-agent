@@ -254,6 +254,9 @@ async def test_content_actions_suppress_final_unless_follow_up_is_explicit(
         )
         == "[SILENT]"
     )
+    from gateway.response_filters import is_intentional_silence_response
+
+    assert is_intentional_silence_response("[SILENT]") is True
     # The marker is one-turn state and cannot suppress a later response.
     assert (
         actions.suppress_redundant_final(

@@ -27,6 +27,13 @@
 //       body: {"spaceId": "...", "path": "...", "name": "..." | null,
 //              "mimeType": "..." | null, "caption": "..." | null,
 //              "kind": "attachment" | "voice"}
+//   - POST /reply       -> {"ok": true, "messageIds": ["..."]}
+//       body: {"spaceId": "...", "messageId": "...",
+//              "items": [{"type": "text", "text": "..."} | attachment]}
+//   - POST /send-group  -> {"ok": true, "parentMessageId": "...",
+//                           "childMessageIds": ["..."], "partCount": 2..6}
+//       body: {"spaceId": "...", "images": [attachment, ...],
+//              "caption": "..." | null}
 //   - POST /react       -> {"ok": true, "reactionId": "..." | null}
 //       body: {"spaceId": "...", "messageId": "<target msg id>",
 //              "emoji": "👀"}
@@ -67,6 +74,11 @@ import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
+import {
+  setExactReaction,
+  sendExactReply,
+  sendImageGroup,
+} from "./conversation-actions.mjs";
 import {
   classifyProbeRejection,
   shouldProbe,
@@ -306,6 +318,7 @@ let Spectrum,
   spectrumRichlink,
   spectrumTyping,
   spectrumPoll,
+  spectrumGroup,
   imessageEffect;
 try {
   ({
@@ -317,6 +330,7 @@ try {
     markdown: spectrumMarkdown,
     richlink: spectrumRichlink,
     typing: spectrumTyping,
+    group: spectrumGroup,
   } = await import("spectrum-ts"));
   ({ imessage, effect: imessageEffect } = await import("spectrum-ts/providers/imessage"));
 } catch (e) {
@@ -800,10 +814,17 @@ function unauthorized(res) {
   res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
 }
 
-function badRequest(res, msg) {
+function badRequest(res, msg, errorClass = "invalid_request") {
   res.statusCode = 400;
   res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify({ ok: false, error: msg }));
+  res.end(
+    JSON.stringify({
+      ok: false,
+      error: msg,
+      error_class: errorClass,
+      retryable: false,
+    })
+  );
 }
 
 function classifySidecarError(err) {
@@ -1079,21 +1100,63 @@ const server = http.createServer(async (req, res) => {
       }
       return ok(res, { messageId: result?.id || null });
     }
+    if (req.url === "/reply") {
+      const { spaceId, messageId, items } = body || {};
+      if (!spaceId || !messageId || !Array.isArray(items) || items.length === 0) {
+        return badRequest(res, "spaceId, messageId and reply items are required");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await sendExactReply({
+        space,
+        messageId,
+        knownMessages,
+        items,
+        text: spectrumText,
+        attachment,
+      });
+      if (!result.found) {
+        return badRequest(res, "message target not found", "target_not_found");
+      }
+      return ok(res, {
+        messageIds: result.messageIds,
+        targetSource: result.source,
+      });
+    }
+    if (req.url === "/send-group") {
+      const { spaceId, images, caption } = body || {};
+      if (!spaceId || !Array.isArray(images)) {
+        return badRequest(res, "spaceId and images are required");
+      }
+      if (images.length < 2 || images.length > 5) {
+        return badRequest(res, "image groups require 2 to 5 images");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await sendImageGroup({
+        space,
+        images,
+        caption,
+        attachment,
+        text: spectrumText,
+        group: spectrumGroup,
+      });
+      return ok(res, result);
+    }
     if (req.url === "/react") {
       const { spaceId, messageId, emoji } = body || {};
       if (!spaceId || !messageId || typeof emoji !== "string" || !emoji) {
         return badRequest(res, "spaceId, messageId and emoji are required");
       }
       const space = await resolveSpace(spaceId);
-      const target =
-        knownMessages.get(messageId) ?? (await space.getMessage(messageId));
-      if (!target) {
-        return badRequest(res, "message not found");
+      const reaction = await setExactReaction({
+        space,
+        messageId,
+        emoji,
+        knownMessages,
+      });
+      if (!reaction.found) {
+        return badRequest(res, "message target not found", "target_not_found");
       }
-      const handle = await target.react(emoji);
-      if (!handle) {
-        return badRequest(res, "reactions not supported on this platform");
-      }
+      const handle = reaction.handle;
       lruSet(
         reactionHandles,
         `${spaceId}\u0000${messageId}`,

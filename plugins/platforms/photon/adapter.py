@@ -800,6 +800,9 @@ class PhotonAdapter(BasePlatformAdapter):
         # With markdown on, format_message preserves fences and the sidecar's
         # markdown() builder renders them (or degrades them readably).
         self.supports_code_blocks = _markdown_enabled()
+        self.conversation_actions_enabled = (
+            extra.get("conversation_actions_enabled") is True
+        )
 
         # Runtime state
         self._sidecar_proc: Optional[subprocess.Popen] = None
@@ -1992,6 +1995,12 @@ class PhotonAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        if reply_to:
+            return await self._sidecar_reply(
+                chat_id,
+                reply_to,
+                [{"type": "text", "text": self.format_message(content)}],
+            )
         return await self._sidecar_send(chat_id, self.format_message(content))
 
     # -- Clarify (native iMessage poll) ------------------------------------
@@ -2060,11 +2069,16 @@ class PhotonAdapter(BasePlatformAdapter):
             from gateway.platforms.base import cache_image_from_url
 
             local_path = await cache_image_from_url(image_url)
-        except Exception:
+        except Exception as exc:
+            if reply_to:
+                return SendResult(
+                    success=False,
+                    error=f"failed to prepare reply attachment: {exc}",
+                )
             # Couldn't fetch the URL — fall back to sending it as text.
             return await super().send_image(chat_id, image_url, caption, reply_to)
         return await self._sidecar_send_attachment(
-            chat_id, local_path, caption=caption,
+            chat_id, local_path, caption=caption, reply_to=reply_to,
         )
 
     async def send_image_file(
@@ -2077,7 +2091,76 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, image_path, caption=caption,
+            chat_id, image_path, caption=caption, reply_to=reply_to,
+        )
+
+    async def send_image_group(
+        self,
+        chat_id: str,
+        image_paths: list[str],
+        caption: Optional[str] = None,
+    ) -> SendResult:
+        """Send 2–5 images as one ordered native iMessage multipart message."""
+        if not 2 <= len(image_paths or []) <= 5:
+            return SendResult(success=False, error="image groups require 2 to 5 images")
+
+        import mimetypes
+
+        images = []
+        for path in image_paths:
+            safe_path = self.validate_media_delivery_path(str(path))
+            if not safe_path:
+                return SendResult(
+                    success=False, error="unsafe or missing image path"
+                )
+            mime_type, _ = mimetypes.guess_type(safe_path)
+            if not mime_type or not mime_type.startswith("image/"):
+                return SendResult(success=False, error="image group contains a non-image file")
+            images.append(
+                {
+                    "path": safe_path,
+                    "name": os.path.basename(safe_path),
+                    "mimeType": mime_type,
+                }
+            )
+
+        body: Dict[str, Any] = {"spaceId": chat_id, "images": images}
+        if caption and caption.strip():
+            body["caption"] = caption.strip()
+        try:
+            data = await self._sidecar_call("/send-group", body)
+        except PhotonSidecarError as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                raw_response={
+                    "error_class": exc.error_class,
+                    "retryable": exc.retryable,
+                },
+                retryable=exc.retryable,
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+        parent_id = data.get("parentMessageId")
+        child_ids = tuple(data.get("childMessageIds") or ())
+        if not parent_id or len(child_ids) != int(data.get("partCount") or 0):
+            return SendResult(
+                success=False, error="Photon returned an incomplete image-group receipt"
+            )
+        self._record_sent_message(parent_id)
+        for message_id in child_ids:
+            self._record_sent_message(message_id)
+        return SendResult(
+            success=True,
+            message_id=parent_id,
+            raw_response={
+                "parent_message_id": parent_id,
+                "child_message_ids": list(child_ids),
+                "part_count": len(child_ids),
+                "presentation": "group",
+            },
+            continuation_message_ids=child_ids,
         )
 
     async def send_voice(
@@ -2091,6 +2174,7 @@ class PhotonAdapter(BasePlatformAdapter):
     ) -> SendResult:
         return await self._sidecar_send_attachment(
             chat_id, audio_path, caption=caption, kind="voice",
+            reply_to=reply_to,
         )
 
     async def send_video(
@@ -2103,7 +2187,7 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, video_path, caption=caption,
+            chat_id, video_path, caption=caption, reply_to=reply_to,
         )
 
     async def send_document(
@@ -2118,6 +2202,7 @@ class PhotonAdapter(BasePlatformAdapter):
     ) -> SendResult:
         return await self._sidecar_send_attachment(
             chat_id, file_path, name=file_name, caption=caption,
+            reply_to=reply_to,
         )
 
     async def send_animation(
@@ -2437,6 +2522,12 @@ class PhotonAdapter(BasePlatformAdapter):
         if result.success:
             return result
 
+        # A native reply is anchored to one exact platform message. Retrying an
+        # ambiguous provider outcome can duplicate it, and the plain-text
+        # fallback below would silently turn it into a top-level message.
+        if reply_to:
+            return result
+
         if self._is_permanent_sidecar_failure(result):
             # Permanent failure classes: retrying cannot succeed and the
             # unconditional plain-text fallback below would double-send the
@@ -2578,6 +2669,53 @@ class PhotonAdapter(BasePlatformAdapter):
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
+    async def _sidecar_reply(
+        self,
+        space_id: str,
+        target_message_id: str,
+        items: list[Dict[str, Any]],
+    ) -> SendResult:
+        """Send native reply parts anchored to one exact Spectrum message."""
+        try:
+            data = await self._sidecar_call(
+                "/reply",
+                {
+                    "spaceId": space_id,
+                    "messageId": target_message_id,
+                    "items": items,
+                },
+            )
+        except PhotonSidecarError as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                raw_response={
+                    "error_class": exc.error_class,
+                    "retryable": exc.retryable,
+                },
+                retryable=exc.retryable,
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+        message_ids = tuple(data.get("messageIds") or ())
+        if not message_ids:
+            return SendResult(
+                success=False, error="Photon reply returned no message identifiers"
+            )
+        for message_id in message_ids:
+            self._record_sent_message(message_id)
+        return SendResult(
+            success=True,
+            message_id=message_ids[-1],
+            raw_response={
+                "message_ids": list(message_ids),
+                "target_message_id": target_message_id,
+                "presentation": "reply",
+            },
+            continuation_message_ids=message_ids[:-1],
+        )
+
     async def _sidecar_send_attachment(
         self,
         space_id: str,
@@ -2587,6 +2725,7 @@ class PhotonAdapter(BasePlatformAdapter):
         mime_type: Optional[str] = None,
         caption: Optional[str] = None,
         kind: str = "attachment",
+        reply_to: Optional[str] = None,
     ) -> SendResult:
         """POST a local file to the sidecar's ``/send-attachment`` endpoint.
 
@@ -2609,6 +2748,24 @@ class PhotonAdapter(BasePlatformAdapter):
 
             guessed, _ = mimetypes.guess_type(safe_path)
             mime_type = guessed or None
+        if reply_to:
+            if kind == "voice":
+                return SendResult(
+                    success=False,
+                    error="native voice-note replies are not supported by Photon",
+                )
+            reply_item: Dict[str, Any] = {
+                "type": "attachment",
+                "path": safe_path,
+            }
+            if name:
+                reply_item["name"] = name
+            if mime_type:
+                reply_item["mimeType"] = mime_type
+            items = [reply_item]
+            if caption and caption.strip():
+                items.append({"type": "text", "text": caption.strip()})
+            return await self._sidecar_reply(space_id, reply_to, items)
         body: Dict[str, Any] = {
             "spaceId": space_id,
             "path": safe_path,

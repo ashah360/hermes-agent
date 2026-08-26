@@ -525,6 +525,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-photon": {
+        "description": "Photon iMessage toolset - native current-conversation actions",
+        "tools": _HERMES_CORE_TOOLS + ["photon_conversation_action"],
+        "includes": []
+    },
+
     "hermes-homeassistant": {
         "description": "Home Assistant bot toolset - smart home event monitoring and control",
         "tools": _HERMES_CORE_TOOLS,

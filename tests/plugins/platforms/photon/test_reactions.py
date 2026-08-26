@@ -115,6 +115,26 @@ async def test_add_reaction_posts_react(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("emoji", ["❤️", "👍", "👎", "😂", "‼️", "❓", "🫡"])
+async def test_reaction_preserves_classic_and_custom_emoji(
+    monkeypatch: pytest.MonkeyPatch, emoji: str
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    calls = _capture_sidecar(adapter)
+
+    result = await adapter.add_reaction(
+        "+15551234567", emoji, message_id="exact-guid"
+    )
+
+    assert result["success"] is True
+    assert calls[0][1] == {
+        "spaceId": "+15551234567",
+        "messageId": "exact-guid",
+        "emoji": emoji,
+    }
+
+
+@pytest.mark.asyncio
 async def test_remove_reaction_posts_unreact(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _make_adapter(monkeypatch)
     calls = _capture_sidecar(adapter)

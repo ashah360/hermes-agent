@@ -209,6 +209,11 @@ async def test_reply_and_images_return_redacted_native_receipts(monkeypatch):
 async def test_content_actions_suppress_final_unless_follow_up_is_explicit(
     monkeypatch,
 ):
+    from tools.approval import (
+        reset_current_observability_context,
+        set_current_observability_context,
+    )
+
     adapter = _Adapter()
     monkeypatch.setattr(
         actions,
@@ -229,15 +234,18 @@ async def test_content_actions_suppress_final_unless_follow_up_is_explicit(
         ),
     )
 
-    await actions.conversation_action_tool(
-        {
-            "action": "reply",
-            "target": {"trigger": True},
-            "text": "already delivered",
-        },
-        session_id="session-id",
-        turn_id="turn-content",
-    )
+    tokens = set_current_observability_context(turn_id="turn-content")
+    try:
+        await actions.conversation_action_tool(
+            {
+                "action": "reply",
+                "target": {"trigger": True},
+                "text": "already delivered",
+            },
+            session_id="session-id",
+        )
+    finally:
+        reset_current_observability_context(tokens)
     assert (
         actions.suppress_redundant_final(
             "ceremonial duplicate",

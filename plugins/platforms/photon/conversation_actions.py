@@ -274,6 +274,13 @@ async def conversation_action_tool(args: Dict[str, Any], **kwargs: Any) -> str:
         session_key,
     )
     turn_id = str(kwargs.get("turn_id") or "")
+    if not turn_id:
+        try:
+            from tools.approval import get_current_turn_id
+
+            turn_id = get_current_turn_id()
+        except Exception:
+            pass
     if action == "present_images":
         result = await adapter.send_image_group(
             chat_id,

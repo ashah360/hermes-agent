@@ -2717,6 +2717,16 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _bind_event_message_id(
+    source: SessionSource, event: MessageEvent
+) -> SessionSource:
+    """Return a per-turn source carrying only this event's provider id."""
+    return dataclasses.replace(
+        source,
+        message_id=str(event.message_id) if event.message_id else None,
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -19222,10 +19232,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Bind volatile provider identity to a per-turn source copy. Adapters
         # often reuse a routing-only SessionSource across events; mutating it
         # would let a later synthetic event inherit the previous message id.
-        source = dataclasses.replace(
-            source,
-            message_id=str(event.message_id) if event.message_id else None,
-        )
+        source = _bind_event_message_id(source, event)
 
         # Build session context
         context = build_session_context(source, self.config, session_entry)

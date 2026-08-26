@@ -158,11 +158,11 @@ async def test_real_user_event_gets_no_marker(monkeypatch, tmp_path):
     assert kwargs["persist_user_display_kind"] is None
 
 
-@pytest.mark.asyncio
-async def test_event_message_id_is_bound_per_turn_and_forwarded_to_persistence(
+def test_event_message_id_is_bound_per_turn_without_stale_inheritance(
     monkeypatch, tmp_path
 ):
     from gateway.session_context import get_session_env
+    from gateway.session import build_session_context
 
     runner = _bootstrap(monkeypatch, tmp_path)
     runner._set_session_env = gateway_run.GatewayRunner._set_session_env.__get__(
@@ -171,53 +171,39 @@ async def test_event_message_id_is_bound_per_turn_and_forwarded_to_persistence(
     runner._clear_session_env = gateway_run.GatewayRunner._clear_session_env.__get__(
         runner, gateway_run.GatewayRunner
     )
-    observed = []
-
-    async def run_agent(**kwargs):
-        observed.append(
-            (
-                get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
-                kwargs["source"].message_id,
-                kwargs.get("persist_user_message_id"),
-            )
-        )
-        return {
-            "final_response": "ack",
-            "messages": [],
-            "tools": [],
-            "history_offset": 0,
-            "last_prompt_tokens": 0,
-        }
-
-    runner._run_agent = AsyncMock(side_effect=run_agent)
     shared_source = _source()
-
-    await runner._handle_message_with_agent(
-        MessageEvent(
-            text="anchored",
-            source=shared_source,
-            message_id="provider-msg-1",
-        ),
+    session_entry = runner.session_store.get_or_create_session.return_value
+    anchored = gateway_run._bind_event_message_id(
         shared_source,
-        SESSION_KEY,
-        1,
+        MessageEvent(
+            text="anchored", source=shared_source, message_id="provider-msg-1"
+        ),
     )
-    await runner._handle_message_with_agent(
+    context = build_session_context(anchored, runner.config, session_entry)
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_MESSAGE_ID", "") == "provider-msg-1"
+    finally:
+        runner._clear_session_env(tokens)
+
+    synthetic = gateway_run._bind_event_message_id(
+        shared_source,
         MessageEvent(
             text="[SYNTHETIC]",
             source=shared_source,
             message_id=None,
             internal=True,
         ),
-        shared_source,
-        SESSION_KEY,
-        2,
     )
+    next_context = build_session_context(synthetic, runner.config, session_entry)
+    next_tokens = runner._set_session_env(next_context)
+    try:
+        assert get_session_env("HERMES_SESSION_MESSAGE_ID", "") == ""
+    finally:
+        runner._clear_session_env(next_tokens)
 
-    assert observed == [
-        ("provider-msg-1", "provider-msg-1", "provider-msg-1"),
-        ("", None, None),
-    ]
+    assert anchored.message_id == "provider-msg-1"
+    assert synthetic.message_id is None
     assert shared_source.message_id is None
 
 

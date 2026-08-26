@@ -51,6 +51,14 @@ def test_schema_exposes_no_arbitrary_destination_and_only_photon_bundle():
     assert "photon_conversation_action" not in resolve_toolset("hermes-telegram")
 
 
+def test_gateway_toolset_resolution_scopes_action_to_photon():
+    from hermes_cli.tools_config import _get_platform_tools
+
+    config = {"platform_toolsets": {}}
+    assert "hermes-photon" in _get_platform_tools(config, "photon")
+    assert "hermes-photon" not in _get_platform_tools(config, "telegram")
+
+
 @pytest.mark.asyncio
 async def test_action_derives_current_chat_and_resolves_earlier_exact_target(
     monkeypatch,

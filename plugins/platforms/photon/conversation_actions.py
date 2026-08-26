@@ -184,11 +184,16 @@ def _resolve_runtime() -> Tuple[Any, Any, str, str]:
         from gateway.run import _gateway_runner_ref
 
         runner = _gateway_runner_ref()
-        adapter = (
-            getattr(runner, "adapters", {}).get(Platform("photon"))
-            if runner
-            else None
-        )
+        adapter = None
+        if runner:
+            platform_key = Platform("photon")
+            profile = get_session_env("HERMES_SESSION_PROFILE", "")
+            if profile:
+                adapter = (
+                    getattr(runner, "_profile_adapters", {}).get(profile, {})
+                ).get(platform_key)
+            if adapter is None:
+                adapter = getattr(runner, "adapters", {}).get(platform_key)
     except Exception:
         runner = adapter = None
     return runner, adapter, chat_id, session_key

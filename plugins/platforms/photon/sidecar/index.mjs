@@ -80,6 +80,7 @@ import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
 import {
   createPerSpaceSerializer,
+  markExactRead,
   setExactReaction,
   sendExactReply,
   sendImageGroup,
@@ -323,6 +324,7 @@ let Spectrum,
   spectrumMarkdown,
   spectrumRichlink,
   spectrumTyping,
+  spectrumRead,
   spectrumPoll,
   spectrumGroup,
   imessageEffect;
@@ -336,6 +338,7 @@ try {
     markdown: spectrumMarkdown,
     richlink: spectrumRichlink,
     typing: spectrumTyping,
+    read: spectrumRead,
     group: spectrumGroup,
   } = await import("spectrum-ts"));
   ({ imessage, effect: imessageEffect } = await import("spectrum-ts/providers/imessage"));
@@ -1168,6 +1171,30 @@ const server = http.createServer(async (req, res) => {
           targetSource: result.source,
         });
       });
+    }
+    if (req.url === "/read") {
+      const { spaceId, messageId } = body || {};
+      if (!spaceId || !messageId) {
+        return badRequest(res, "spaceId and messageId are required");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await markExactRead({
+        space,
+        messageId,
+        knownMessages,
+        read: spectrumRead,
+      });
+      if (!result.found) {
+        return badRequest(res, "message target not found", "target_not_found");
+      }
+      if (!result.inbound) {
+        return badRequest(
+          res,
+          "message target is not inbound",
+          "target_not_inbound"
+        );
+      }
+      return ok(res, { targetSource: result.source });
     }
     if (req.url === "/send-group") {
       const { spaceId, images, caption } = body || {};

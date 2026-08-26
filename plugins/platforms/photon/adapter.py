@@ -806,6 +806,13 @@ class PhotonAdapter(BasePlatformAdapter):
         self.semantic_chunking_enabled = (
             extra.get("semantic_chunking_enabled") is True
         )
+        _read_receipts = extra.get("send_read_receipts", True)
+        self.send_read_receipts = (
+            _read_receipts
+            if isinstance(_read_receipts, bool)
+            else str(_read_receipts or "").strip().lower()
+            not in {"0", "false", "no", "off"}
+        )
         self._semantic_chunk_soft_chars = extra.get("semantic_chunk_soft_chars")
         self._semantic_chunk_hard_chars = extra.get("semantic_chunk_hard_chars")
 
@@ -1489,6 +1496,34 @@ class PhotonAdapter(BasePlatformAdapter):
             media_types=media_types,
         )
         await self.handle_message(message_event)
+        self._schedule_read_receipt(space_id, event.get("messageId"))
+
+    def _schedule_read_receipt(
+        self, space_id: str, message_id: Optional[str]
+    ) -> None:
+        """Mark one accepted inbound message read without delaying dispatch."""
+        if not self.send_read_receipts or not space_id or not message_id:
+            return
+        task = asyncio.create_task(self._mark_read(space_id, message_id))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _mark_read(self, space_id: str, message_id: str) -> None:
+        try:
+            await asyncio.wait_for(
+                self._sidecar_call(
+                    "/read", {"spaceId": space_id, "messageId": message_id}
+                ),
+                timeout=5.0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "[photon] failed to mark inbound message %s read: %s",
+                message_id,
+                exc,
+            )
 
     # -- Sidecar lifecycle -------------------------------------------------
 

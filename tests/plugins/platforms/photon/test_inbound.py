@@ -11,6 +11,7 @@ import base64
 import json
 from pathlib import Path
 from typing import Any, Dict, List
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,10 +20,12 @@ from gateway.platforms.base import MessageEvent, MessageType
 from plugins.platforms.photon.adapter import PhotonAdapter
 
 
-def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
+def _make_adapter(
+    monkeypatch: pytest.MonkeyPatch, *, extra: Dict[str, Any] | None = None
+) -> PhotonAdapter:
     monkeypatch.setenv("PHOTON_PROJECT_ID", "test-project-id")
     monkeypatch.setenv("PHOTON_PROJECT_SECRET", "test-project-secret")
-    cfg = PlatformConfig(enabled=True, token="", extra={})
+    cfg = PlatformConfig(enabled=True, token="", extra=extra or {})
     return PhotonAdapter(cfg)
 
 
@@ -65,6 +68,60 @@ async def test_dispatch_text_dm(monkeypatch: pytest.MonkeyPatch) -> None:
     assert src.chat_id == "+15551234567"
     assert src.chat_type == "dm"
     assert src.user_id == "+15551234567"
+
+
+@pytest.mark.asyncio
+async def test_normal_inbound_schedules_exact_read_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    _capture(adapter, monkeypatch)
+    adapter._sidecar_call = AsyncMock(return_value={"ok": True})
+
+    await adapter._dispatch_inbound(_dm_event("read me", "read-1"))
+    await asyncio.gather(*list(adapter._background_tasks))
+
+    adapter._sidecar_call.assert_awaited_once_with(
+        "/read",
+        {"spaceId": "+15551234567", "messageId": "read-1"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra", "message_id"),
+    [
+        ({"send_read_receipts": False}, "read-disabled"),
+        ({}, ""),
+    ],
+)
+async def test_disabled_or_unanchored_inbound_sends_no_read(
+    monkeypatch: pytest.MonkeyPatch,
+    extra: Dict[str, Any],
+    message_id: str,
+) -> None:
+    adapter = _make_adapter(monkeypatch, extra=extra)
+    _capture(adapter, monkeypatch)
+    adapter._sidecar_call = AsyncMock(return_value={"ok": True})
+
+    await adapter._dispatch_inbound(_dm_event("no receipt", message_id))
+    await asyncio.sleep(0)
+
+    adapter._sidecar_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_read_failure_never_blocks_accepted_inbound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    adapter._sidecar_call = AsyncMock(side_effect=RuntimeError("sidecar down"))
+
+    await adapter._dispatch_inbound(_dm_event("still dispatch", "read-fails"))
+    await asyncio.gather(*list(adapter._background_tasks))
+
+    assert [event.text for event in captured] == ["still dispatch"]
 
 
 # A real 1x1 transparent PNG (passes base.py's _looks_like_image magic check).

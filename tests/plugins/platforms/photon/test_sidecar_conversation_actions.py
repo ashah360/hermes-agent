@@ -20,6 +20,7 @@ def test_sidecar_exact_targets_replies_reactions_and_atomic_groups(tmp_path):
 import assert from "node:assert/strict";
 import {{
   createPerSpaceSerializer,
+  markExactRead,
   resolveMessageTarget,
   setExactReaction,
   sendExactReply,
@@ -59,6 +60,47 @@ assert.equal(
   recoveredTarget,
 );
 assert.equal(getCalls, 1);
+
+const readSends = [];
+const recentInbound = {{ id: "recent-inbound", direction: "inbound" }};
+const fallbackInbound = {{ id: "fallback-inbound", direction: "inbound" }};
+const outboundTarget = {{ id: "outbound", direction: "outbound" }};
+const readSpace = {{
+  async getMessage(id) {{
+    if (id === "fallback-inbound") return fallbackInbound;
+    if (id === "outbound") return outboundTarget;
+    return undefined;
+  }},
+  async send(content) {{ readSends.push(content); }},
+}};
+const buildRead = (target) => ({{ type: "read", target }});
+assert.deepEqual(
+  await markExactRead({{
+    space: readSpace,
+    messageId: "recent-inbound",
+    knownMessages: new Map([["recent-inbound", recentInbound]]),
+    read: buildRead,
+  }}),
+  {{ found: true, inbound: true, source: "cache" }},
+);
+assert.deepEqual(readSends[0], {{ type: "read", target: recentInbound }});
+assert.deepEqual(
+  await markExactRead({{
+    space: readSpace,
+    messageId: "fallback-inbound",
+    knownMessages: new Map(),
+    read: buildRead,
+  }}),
+  {{ found: true, inbound: true, source: "space" }},
+);
+const rejectedRead = await markExactRead({{
+  space: readSpace,
+  messageId: "outbound",
+  knownMessages: new Map(),
+  read: buildRead,
+}});
+assert.equal(rejectedRead.inbound, false);
+assert.equal(readSends.length, 2);
 
 for (const emoji of ["❤️", "🫡"]) {{
   const reaction = await setExactReaction({{

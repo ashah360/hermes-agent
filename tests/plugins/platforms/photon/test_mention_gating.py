@@ -72,6 +72,7 @@ async def test_group_message_dropped_without_mention(monkeypatch: pytest.MonkeyP
 
     await adapter._dispatch_inbound(_group_payload("just chatting, no wake word"))
     assert captured == []
+    assert adapter._background_tasks == set()
 
 
 @pytest.mark.asyncio

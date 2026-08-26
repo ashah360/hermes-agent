@@ -68,6 +68,25 @@ export async function setExactReaction({
   return { found: true, source, handle };
 }
 
+export async function markExactRead({
+  space,
+  messageId,
+  knownMessages,
+  read,
+}) {
+  const { target, source } = await resolveMessageTarget(
+    space,
+    messageId,
+    knownMessages
+  );
+  if (!target) return { found: false, inbound: false, source };
+  if (target.direction !== "inbound") {
+    return { found: true, inbound: false, source };
+  }
+  await space.send(read(target));
+  return { found: true, inbound: true, source };
+}
+
 export async function sendExactReply({
   space,
   messageId,

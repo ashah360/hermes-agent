@@ -16,7 +16,7 @@ class _Adapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(
             PlatformConfig(enabled=True, token="fake", typing_indicator=False),
-            Platform.PHOTON,
+            Platform("photon"),
         )
         self.sent = []
 
@@ -42,7 +42,7 @@ def _event(message_id, *, chat_id="chat-1", internal=False):
         text=message_id or "synthetic",
         message_type=MessageType.TEXT,
         source=SessionSource(
-            platform=Platform.PHOTON,
+            platform=Platform("photon"),
             chat_id=chat_id,
             chat_type="dm",
             user_id="user-1",

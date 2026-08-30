@@ -2776,6 +2776,17 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# Opt-in Phase 1 guidance stored on the gateway routing entry. SessionEntry
+# metadata already survives gateway restarts and is replaced at every
+# conversation boundary (/new, /resume), so no new persistence layer is needed.
+_DETACHED_MODE_METADATA_KEY = "detached_read_only_mode"
+_DETACHED_MODE_PROMPT = """## Detached Read-Only Work (Experimental)
+For read-only, self-contained work likely to take more than a few seconds, use `delegate_task` with `background=true`. After a successful dispatch, optionally give one short natural acknowledgement and end the foreground turn; do not narrate the dispatch, poll, or emit cadence/progress updates. Keep quick work inline.
+
+Workers never address the user. Their completion returns internally as a new turn; you, the foreground conversational agent with full conversation context, interpret and present it.
+
+Never detach tasks requiring user interaction or approval, or consequential external writes, purchases, posts, messages, cancellations, credential changes, or deployment. If uncertain, keep the task inline."""
+
 # Conversation-scoped per-session state registry (legacy contract).
 # The state itself now lives in ``SessionState.conversation`` (see
 # gateway/session_state.py) and boundaries clear it structurally via
@@ -5400,6 +5411,10 @@ class TurnRunner:
         )
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+        combined_ephemeral = self._runner._with_detached_mode_prompt(
+            ctx.session_key,
+            combined_ephemeral,
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -9478,6 +9493,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if override and override.system_prompt:
                 return (override.system_prompt or "").strip()
         return getattr(self, "_ephemeral_system_prompt", None) or ""
+
+    def _detached_mode_enabled(self, session_key: str) -> bool:
+        """Return the persisted opt-in state for one gateway conversation."""
+        if not session_key:
+            return False
+        try:
+            value = self.session_store.get_session_metadata(
+                session_key,
+                _DETACHED_MODE_METADATA_KEY,
+                False,
+            )
+            # Fail closed on stale/corrupt values and on loose MagicMock test
+            # stores: only the exact persisted JSON boolean enables the mode.
+            return value is True
+        except Exception:
+            logger.debug(
+                "Failed to read detached-mode state for %s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+    def _with_detached_mode_prompt(self, session_key: str, prompt: str) -> str:
+        """Append stable opt-in guidance; return mode-off bytes untouched."""
+        if not self._detached_mode_enabled(session_key):
+            return prompt
+        if not prompt:
+            return _DETACHED_MODE_PROMPT
+        return f"{prompt}\n\n{_DETACHED_MODE_PROMPT}"
 
     @staticmethod
     def _load_reasoning_config(model: str = "") -> dict | None:
@@ -17691,6 +17735,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
+
+        if canonical == "detached":
+            return await self._handle_detached_command(event)
 
         if canonical == "memory":
             return await self._handle_memory_command(event)

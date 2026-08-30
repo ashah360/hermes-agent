@@ -191,6 +191,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[all] [reason]", busy_policy="dispatch"),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>", busy_policy="dispatch"),
+    CommandDef("detached", "Toggle detached read-only work for this conversation", "Session",
+               args_hint="[on|off|status]", subcommands=("on", "off", "status"),
+               gateway_only=True),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
@@ -1363,12 +1366,15 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     interactive surface; whoami is a rare debug lookup) — without this
 #     entry /loop tips the registry past the 50-cap and silently clamps
 #     /platform, breaking Telegram parity.
+#   - detached: experimental per-conversation runtime mode; reached via
+#     /hermes detached on|off|status so it does not displace an established
+#     native slash while Slack remains capped at 50.
 #   - platform: informational platform/environment lookup; reached via
 #     /hermes platform on Slack. Demoted when /save became gateway-available
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "detached", "platform"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

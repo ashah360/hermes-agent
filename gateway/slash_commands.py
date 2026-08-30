@@ -3592,6 +3592,52 @@ class GatewaySlashCommandsMixin:
             )
         return f"```diff\n{diff}{note}\n```"
 
+    async def _handle_detached_command(self, event: MessageEvent) -> str:
+        """Toggle the opt-in detached read-only work mode for one conversation."""
+        verb = (event.get_command_args() or "").strip().lower() or "status"
+        if verb not in {"on", "off", "status"}:
+            return "Usage: /detached on | off | status"
+
+        entry = await self.async_session_store.get_or_create_session(event.source)
+        if entry is None:
+            return "Detached mode unavailable (no conversation)."
+
+        from gateway.run import _DETACHED_MODE_METADATA_KEY
+
+        session_key = entry.session_key
+        stored = await self.async_session_store.get_session_metadata(
+            session_key,
+            _DETACHED_MODE_METADATA_KEY,
+            False,
+        )
+        enabled = stored is True
+        if verb == "status":
+            label = "ON" if enabled else "OFF"
+            return f"Detached read-only work is {label} for this conversation."
+
+        requested = verb == "on"
+        if requested == enabled:
+            label = "ON" if enabled else "OFF"
+            return f"Detached read-only work is already {label} for this conversation."
+
+        saved = await self.async_session_store.set_session_metadata(
+            session_key,
+            _DETACHED_MODE_METADATA_KEY,
+            requested,
+        )
+        if not saved:
+            return "Could not update detached mode for this conversation."
+
+        # The mode guidance is part of the cached agent's stable effective
+        # system prompt. Rebuild only this session on the next turn.
+        self._evict_cached_agent(session_key)
+        if requested:
+            return (
+                "Detached read-only work is ON for this conversation. "
+                "It resets on /new."
+            )
+        return "Detached read-only work is OFF for this conversation."
+
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
 

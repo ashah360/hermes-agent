@@ -101,6 +101,47 @@ def _normalize_temperature_ranges(text: str) -> str:
     return text
 
 
+# Compact business magnitudes ("$38M", "750K", "2.4B") must be expanded
+# BEFORE the generic metric-unit rules below, which would otherwise read the
+# suffix as a unit ("38M" -> "38 metres").  Lowercase "m" is kept as metres
+# when followed by explicit metric context ("38m distance").  Ported from the
+# proven live Jeeves voice patch with its regression tests.
+_FINANCIAL_MAGNITUDE_RE = re.compile(
+    r"(?<![\w$€£])(?P<currency>NZ\$|A\$|US\$|[$€£])?\s*"
+    r"(?P<number>[\d,]*\d(?:\.\d+)?)\s*(?P<suffix>[KkMmBb])\b"
+)
+_METRIC_METRE_CONTEXT_RE = re.compile(
+    r"^\s*(?:distance|length|height|width|depth|radius|diameter|altitude|"
+    r"elevation|tall|wide|long|high|deep|metres?|meters?)\b",
+    flags=re.IGNORECASE,
+)
+_MAGNITUDE_WORDS = {"k": "thousand", "m": "million", "b": "billion"}
+_CURRENCY_WORDS = {
+    "$": "dollars",
+    "US$": "US dollars",
+    "A$": "Australian dollars",
+    "NZ$": "New Zealand dollars",
+    "€": "euros",
+    "£": "pounds",
+}
+
+
+def _normalize_financial_magnitudes(text: str) -> str:
+    """Expand compact business magnitudes before generic metric-unit cleanup."""
+
+    def replace(match: "re.Match[str]") -> str:
+        currency = match.group("currency")
+        suffix = match.group("suffix")
+        if not currency and suffix == "m" and _METRIC_METRE_CONTEXT_RE.match(text[match.end():]):
+            return match.group(0)
+        parts = [match.group("number"), _MAGNITUDE_WORDS[suffix.lower()]]
+        if currency:
+            parts.append(_CURRENCY_WORDS[currency])
+        return " ".join(parts)
+
+    return _FINANCIAL_MAGNITUDE_RE.sub(replace, text)
+
+
 def normalize_symbols_for_tts(text: str) -> str:
     """Expand common symbols/shorthand into words a TTS engine reads well."""
     if not text:
@@ -110,6 +151,7 @@ def normalize_symbols_for_tts(text: str) -> str:
     text = re.sub("[   ]", " ", text)  # non-breaking / thin spaces
     text = text.replace("\u2212", "-")  # minus sign
     text = text.replace("…", "...")  # ellipsis
+    text = _normalize_financial_magnitudes(text)
     text = _normalize_temperature_ranges(text)
 
     # Temperatures with a number.  Do this before generic degree handling.

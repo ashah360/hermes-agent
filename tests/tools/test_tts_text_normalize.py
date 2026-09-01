@@ -47,3 +47,24 @@ def test_prepare_spoken_text_polish_edge_cases():
     assert "and/or" in prepare_spoken_text("choose and/or option")
     assert "N/A" in prepare_spoken_text("status N/A here")
     assert "2026/06/02" in prepare_spoken_text("due 2026/06/02 ok")
+
+
+def test_prepare_spoken_text_expands_financial_magnitude_suffixes():
+    # Regression suite from the live Jeeves voice patch: compact business
+    # magnitudes must be spoken as words on every scripted speech path.
+    assert prepare_spoken_text("$38M") == "38 million dollars"
+    assert prepare_spoken_text("38M deposits") == "38 million deposits"
+    assert prepare_spoken_text("$2.4B") == "2.4 billion dollars"
+    assert prepare_spoken_text("750K") == "750 thousand"
+    assert prepare_spoken_text("€38M") == "38 million euros"
+
+
+def test_prepare_spoken_text_preserves_explicit_metric_metres():
+    # Lowercase m followed by metric context stays metres (live patch guard).
+    assert prepare_spoken_text("38m distance") == "38 metres distance"
+
+
+def test_financial_magnitudes_do_not_break_existing_units():
+    # The magnitude rule must not swallow genuine metric units.
+    assert "120 millimetres" in prepare_spoken_text("rain was 120mm today")
+    assert "9 kilometres per hour" in prepare_spoken_text("wind 9 km/h")

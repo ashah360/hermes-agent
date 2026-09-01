@@ -590,6 +590,10 @@ class VoiceReceiver:
         # the earliest signal a user started talking, used for immediate
         # playback interruption (barge-in). Live-patch behavior, kept.
         self._on_speech_start = on_speech_start
+        # When set (realtime lane frame-tap mode), decoded PCM frames are
+        # forwarded to the sink instead of the silence-detection buffers, so
+        # exactly ONE lane consumes a given utterance (never both).
+        self._frame_sink = None
         self._running = False
 
         # Decryption
@@ -649,6 +653,30 @@ class VoiceReceiver:
 
     def resume(self):
         self._paused = False
+
+    def set_frame_sink(self, sink) -> None:
+        """Install (or clear, with ``None``) the realtime frame tap.
+
+        With a sink installed the cascaded silence-detection path is inert:
+        frames never reach the per-user buffers, so ``check_silence`` yields
+        nothing and no Whisper transcription can fire for them.
+        """
+        self._frame_sink = sink
+
+    def _deliver_pcm(self, ssrc: int, pcm: bytes) -> None:
+        """Route one decoded PCM frame: frame sink (realtime) XOR buffers."""
+        sink = self._frame_sink
+        if sink is not None:
+            with self._lock:
+                user_id = self._ssrc_to_user.get(ssrc, 0)
+            try:
+                sink(user_id, ssrc, pcm)
+            except Exception:
+                logger.debug("Voice frame sink failed", exc_info=True)
+            return
+        with self._lock:
+            self._buffers[ssrc].extend(pcm)
+            self._last_packet_time[ssrc] = time.monotonic()
 
     # ------------------------------------------------------------------
     # SSRC -> user_id mapping via SPEAKING opcode hook
@@ -827,9 +855,7 @@ class VoiceReceiver:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
-            with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+            self._deliver_pcm(ssrc, pcm)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -4358,6 +4384,104 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.%s config: %s", key, e)
             return default
 
+    def _realtime_voice_raw_config(self) -> Dict[str, Any]:
+        """Return the raw ``...voice.realtime`` mapping from config.yaml.
+
+        Checked under both ``gateway.platforms.discord`` and the top-level
+        ``platforms.discord`` map (``gateway/config.py`` resolves both).
+        Behavioral config only — never env vars.  Deliberately does NOT
+        import the realtime package: this is the lazy gate.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+        except Exception:
+            return {}
+        for root in ((cfg.get("gateway") or {}), cfg):
+            if not isinstance(root, dict):
+                continue
+            plat = ((root.get("platforms") or {}).get("discord") or {})
+            if not isinstance(plat, dict):
+                continue
+            rt = ((plat.get("voice") or {}).get("realtime") or {})
+            if isinstance(rt, dict) and rt:
+                return rt
+        return {}
+
+    def _realtime_voice_enabled(self) -> bool:
+        """True when the realtime lane flag is on (default: off)."""
+        raw = self._realtime_voice_raw_config().get("enabled")
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(raw)
+
+    async def _start_realtime_lane_if_enabled(self, guild_id: int, vc, receiver):
+        """Start the realtime lane for this guild, or return None (cascaded).
+
+        The realtime package is imported ONLY here, after the flag check, so
+        disabled deployments never pay an import cost or optional-dep risk.
+        Any failure — missing secret, connect timeout, voice-echo mismatch —
+        logs, counts, and falls back to the cascaded lane exactly as today.
+        """
+        if not self._realtime_voice_enabled():
+            return None
+        try:
+            try:
+                from .realtime import create_lane
+            except ImportError:
+                from realtime import create_lane
+            lane = create_lane(
+                adapter=self,
+                guild_id=guild_id,
+                voice_client=vc,
+                receiver=receiver,
+                raw_config=self._realtime_voice_raw_config(),
+            )
+            ok = await lane.start()
+        except Exception as e:
+            logger.warning(
+                "[%s] Realtime voice lane failed to start (guild=%d): %s — "
+                "falling back to cascaded voice", self.name, guild_id, e,
+            )
+            return None
+        if not ok:
+            logger.warning(
+                "[%s] Realtime voice lane unavailable (guild=%d) — "
+                "falling back to cascaded voice", self.name, guild_id,
+            )
+            return None
+        lanes = getattr(self, "_realtime_lanes", None)
+        if lanes is None:
+            lanes = {}
+            self._realtime_lanes = lanes
+        lanes[guild_id] = lane
+        # Single-owner handoff: with the sink installed the silence path is
+        # inert, so a user turn can never be consumed by both lanes.
+        receiver.set_frame_sink(self._realtime_frame_sink(guild_id, lane))
+        return lane
+
+    def _realtime_frame_sink(self, guild_id: int, lane):
+        """Frame sink wrapper enforcing the allowed-user gate per frame batch."""
+        guild_getter = (lambda: self._client.get_guild(guild_id)) if self._client else (lambda: None)
+        allowed_cache: Dict[int, bool] = {}
+
+        def _sink(user_id: int, ssrc: int, pcm: bytes) -> None:
+            if user_id:
+                allowed = allowed_cache.get(user_id)
+                if allowed is None:
+                    try:
+                        allowed = self._is_allowed_user(
+                            str(user_id), guild=guild_getter(), is_dm=False
+                        )
+                    except Exception:
+                        allowed = False
+                    allowed_cache[user_id] = allowed
+                if not allowed:
+                    return
+            lane.on_input_frame(user_id, ssrc, pcm)
+
+        return _sink
+
     def _load_voice_timeout(self) -> int:
         """Return voice-channel inactivity timeout seconds; 0 disables it."""
         return self._load_discord_int_config(
@@ -4635,11 +4759,29 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.warning("Voice mixer failed to start: %s", e)
 
+            # Realtime lane (feature-flagged, default off). Never fails the
+            # join: any lane-start problem falls back to the cascaded path.
+            receiver = self._voice_receivers.get(guild_id)
+            if receiver is not None:
+                try:
+                    await self._start_realtime_lane_if_enabled(guild_id, vc, receiver)
+                except Exception as e:
+                    logger.warning("Realtime voice lane startup error: %s", e)
+
             return True
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            # Stop the realtime lane first (if any): revokes voice delivery
+            # for live dispatches (their text results still post via outbox).
+            lane = getattr(self, "_realtime_lanes", {}).pop(guild_id, None)
+            if lane is not None:
+                try:
+                    await lane.stop(reason="leave")
+                except Exception:
+                    logger.debug("Realtime lane stop failed", exc_info=True)
+
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []

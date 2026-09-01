@@ -163,3 +163,94 @@ class TestPlayAckInVoice:
         assert await adapter.play_ack_in_voice(111) is False
 
 
+
+# =====================================================================
+# StreamingMixerChild (realtime lane / exact-TTS playback)
+# =====================================================================
+
+class TestStreamingMixerChild:
+    def _frame(self, value=1000):
+        return np.full(vm.SAMPLES_PER_FRAME * vm.CHANNELS, value, dtype=np.int16).tobytes()
+
+    def test_plays_fed_audio_through_mixer(self):
+        mx = vm.VoiceMixer()
+        child = vm.StreamingMixerChild("realtime")
+        mx.attach_stream(child)
+        child.feed(self._frame() * 2)
+        out1 = np.frombuffer(mx.read(), dtype=np.int16)
+        out2 = np.frombuffer(mx.read(), dtype=np.int16)
+        assert int(np.max(np.abs(out1))) > 0
+        assert int(np.max(np.abs(out2))) > 0
+
+    def test_starving_stream_keeps_child_alive_with_silence(self):
+        mx = vm.VoiceMixer()
+        child = vm.StreamingMixerChild("realtime")
+        mx.attach_stream(child)
+        child.feed(self._frame())
+        assert int(np.max(np.abs(np.frombuffer(mx.read(), dtype=np.int16)))) > 0
+        # Starving (no data, not ended): silence but child stays attached.
+        assert mx.read() == vm.SILENCE_FRAME
+        child.feed(self._frame())
+        assert int(np.max(np.abs(np.frombuffer(mx.read(), dtype=np.int16)))) > 0
+
+    def test_clear_drops_queued_audio_within_one_frame(self):
+        # Barge-in contract: after clear(), the very next mixer frame is
+        # silence — 20ms worst-case in-process latency.
+        mx = vm.VoiceMixer()
+        child = vm.StreamingMixerChild("realtime")
+        mx.attach_stream(child)
+        child.feed(self._frame() * 50)   # 1s of queued audio
+        assert int(np.max(np.abs(np.frombuffer(mx.read(), dtype=np.int16)))) > 0
+        child.clear()
+        assert mx.read() == vm.SILENCE_FRAME
+
+    def test_end_finishes_child_after_drain_and_releases_duck(self):
+        mx = vm.VoiceMixer(ambient_gain=0.5, duck_gain=0.0, duck_release_ms=20)
+        amb = vm.synth_ambient_pcm(seconds=0.5)
+        mx.set_ambient(amb)
+        child = vm.StreamingMixerChild("realtime")
+        mx.attach_stream(child)
+        assert mx.speech_active is True  # duck engaged while stream attached
+        child.feed(self._frame())
+        child.end()
+        mx.read()   # drains the fed frame
+        mx.read()   # child finished -> removed, duck release begins
+        assert mx.speech_active is False
+
+    def test_partial_frame_feed_is_buffered_not_dropped(self):
+        mx = vm.VoiceMixer()
+        child = vm.StreamingMixerChild("realtime")
+        mx.attach_stream(child)
+        half = self._frame()[: vm.FRAME_SIZE // 2]
+        child.feed(half)
+        # Not a full frame yet -> silence, but bytes retained.
+        assert mx.read() == vm.SILENCE_FRAME
+        child.feed(half)
+        assert int(np.max(np.abs(np.frombuffer(mx.read(), dtype=np.int16)))) > 0
+
+    def test_pending_ms_reports_queue_depth(self):
+        child = vm.StreamingMixerChild("realtime")
+        child.feed(self._frame() * 5)
+        assert child.pending_ms() == 5 * vm.FRAME_LENGTH_MS
+
+
+class TestInterruptVoicePlayback:
+    def test_stops_mixer_speech_immediately(self):
+        # Live-patch regression: playback interruption keeps the mixer alive.
+        adapter = _make_adapter()
+        mixer = MagicMock()
+        adapter._voice_mixers = {111: mixer}
+        assert adapter.interrupt_voice_playback(111) is True
+        mixer.stop_speech.assert_called_once_with()
+
+    def test_falls_back_to_vc_stop_without_mixer(self):
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        adapter._voice_clients = {111: vc}
+        assert adapter.interrupt_voice_playback(111) is True
+        vc.stop.assert_called_once_with()
+
+    def test_false_when_nothing_playing(self):
+        adapter = _make_adapter()
+        assert adapter.interrupt_voice_playback(111) is False

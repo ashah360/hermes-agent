@@ -583,9 +583,13 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(self, voice_client, allowed_user_ids: set = None, on_speech_start=None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        # Called with the user_id when a SPEAKING(speaking=1) event arrives —
+        # the earliest signal a user started talking, used for immediate
+        # playback interruption (barge-in). Live-patch behavior, kept.
+        self._on_speech_start = on_speech_start
         self._running = False
 
         # Decryption
@@ -673,6 +677,11 @@ class VoiceReceiver:
                 if ssrc and user_id:
                     logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
                     receiver_self.map_ssrc(int(ssrc), int(user_id))
+                    if data.get("speaking") and receiver_self._on_speech_start:
+                        try:
+                            receiver_self._on_speech_start(int(user_id))
+                        except Exception:
+                            logger.debug("Voice speech-start callback failed", exc_info=True)
             if original_hook:
                 await original_hook(ws, msg)
 
@@ -4553,6 +4562,18 @@ class DiscordAdapter(BasePlatformAdapter):
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
 
+    def interrupt_voice_playback(self, guild_id: int) -> bool:
+        """Stop current speech immediately while keeping the VC mixer alive."""
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id)
+        if mixer is not None:
+            mixer.stop_speech()
+            return True
+        vc = getattr(self, "_voice_clients", {}).get(guild_id)
+        if vc is not None and vc.is_playing():
+            vc.stop()
+            return True
+        return False
+
     async def join_voice_channel(self, channel, *, text_channel_id: int = None, source: dict = None) -> bool:
         """Join a Discord voice channel. Returns True on success.
 
@@ -4590,7 +4611,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Start voice receiver (Phase 2: listen to users)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    # Barge-in: a user starting to speak stops current playback
+                    # immediately (live-patch behavior, kept for both lanes).
+                    on_speech_start=lambda _user_id: self.interrupt_voice_playback(guild_id),
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(

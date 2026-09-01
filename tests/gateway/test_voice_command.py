@@ -457,6 +457,30 @@ class TestVoiceReceiver:
         receiver.map_ssrc(100, 99)
         assert receiver._ssrc_to_user[100] == 99
 
+    @pytest.mark.asyncio
+    async def test_speaking_event_triggers_speech_start_callback(self):
+        # Live-patch regression: a SPEAKING event with speaking=1 must fire the
+        # on_speech_start callback so playback can be interrupted immediately.
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        from unittest.mock import MagicMock
+
+        callback = MagicMock()
+        mock_vc = MagicMock()
+        mock_vc._connection.secret_key = [0] * 32
+        mock_vc._connection.dave_session = None
+        mock_vc._connection.ssrc = 9999
+        mock_vc._connection.add_socket_listener = MagicMock()
+        mock_vc._connection.remove_socket_listener = MagicMock()
+        mock_vc._connection.hook = None
+        receiver = VoiceReceiver(mock_vc, on_speech_start=callback)
+
+        receiver.start()
+        await mock_vc._connection.hook(
+            None, {"op": 5, "d": {"ssrc": 100, "user_id": "42", "speaking": 1}}
+        )
+
+        callback.assert_called_once_with(42)
+
 
     def test_check_silence_returns_completed_utterance(self):
         receiver = self._make_receiver()

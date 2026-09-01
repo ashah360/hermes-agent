@@ -153,6 +153,86 @@ class MixerChild:
         return samples
 
 
+class StreamingMixerChild:
+    """A continuous PCM stream child for :class:`VoiceMixer`.
+
+    Unlike :class:`MixerChild` (one fixed clip), this child is fed arbitrary
+    48 kHz / stereo / s16le PCM incrementally (``feed``) — realtime-API audio
+    deltas or streamed TTS chunks — and stays alive through starvation gaps
+    (returning silence) until :meth:`end` is called and the buffer drains.
+
+    ``clear()`` drops all queued audio immediately: the very next mixer frame
+    is silence, bounding in-process barge-in latency to one 20 ms frame.
+
+    Thread safety: ``feed``/``clear``/``end`` are called from the asyncio loop
+    thread while ``read_frame`` runs on discord.py's sender thread; all shared
+    state is guarded by a lock.
+    """
+
+    __slots__ = ("name", "gain", "is_speech", "_lock", "_buf", "_ended", "_finished")
+
+    def __init__(self, name: str, *, gain: float = 1.0):
+        self.name = name
+        self.gain = float(gain)
+        self.is_speech = True
+        self._lock = threading.Lock()
+        self._buf = bytearray()
+        self._ended = False
+        self._finished = False
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    def feed(self, pcm: bytes) -> None:
+        """Append PCM bytes (any length; framing is handled internally)."""
+        if not pcm:
+            return
+        with self._lock:
+            if not self._ended:
+                self._buf.extend(pcm)
+
+    def clear(self) -> None:
+        """Drop all queued audio immediately (barge-in)."""
+        with self._lock:
+            self._buf.clear()
+
+    def end(self) -> None:
+        """Mark the stream complete; the child finishes once drained."""
+        with self._lock:
+            self._ended = True
+
+    def pending_ms(self) -> int:
+        """Queued audio depth in whole frames, in milliseconds."""
+        with self._lock:
+            return (len(self._buf) // FRAME_SIZE) * FRAME_LENGTH_MS
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        np = _require_numpy()
+        with self._lock:
+            if self._finished:
+                return None
+            if len(self._buf) >= FRAME_SIZE:
+                chunk = bytes(self._buf[:FRAME_SIZE])
+                del self._buf[:FRAME_SIZE]
+            elif self._ended:
+                if self._buf:
+                    chunk = bytes(self._buf) + b"\x00" * (FRAME_SIZE - len(self._buf))
+                    self._buf.clear()
+                else:
+                    self._finished = True
+                    return None
+            else:
+                # Starving mid-stream: keep the child (and the duck) alive.
+                chunk = None
+        if chunk is None:
+            return np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        if self.gain != 1.0:
+            samples = samples * self.gain
+        return samples
+
+
 class VoiceMixer(discord.AudioSource):
     """A continuous ``discord.AudioSource`` that mixes N child streams.
 
@@ -224,6 +304,19 @@ class VoiceMixer(discord.AudioSource):
                 gain=self._speech_gain if gain is None else float(gain),
                 is_speech=True, fade_in_ms=fade_in_ms,
             )
+            self._speech.append(child)
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+
+    def attach_stream(self, child: "StreamingMixerChild") -> None:
+        """Attach a continuous stream child over the ambient bed (ducks it).
+
+        The child stays attached (holding the duck) until it finishes —
+        ``end()`` + drained — or ``clear()`` + ``end()`` on barge-in.
+        """
+        with self._lock:
             self._speech.append(child)
             self._speech_active = True
             self._duck_release_left = 0

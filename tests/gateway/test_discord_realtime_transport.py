@@ -352,13 +352,21 @@ class TestOutbound:
         assert any(m["type"] == "input_audio_buffer.commit" for m in ws.sent)
 
     @pytest.mark.asyncio
-    async def test_cancel_response_nowait_sends_cancel(self):
+    async def test_cancel_response_nowait_sends_cancel_only_when_active(self):
         transport, ws, lane, _ = _make_transport()
         await transport.connect()
+        # No response in flight: the send-time check suppresses the frame
+        # (live response_cancel_not_active fix).
+        transport.cancel_response_nowait()
+        await asyncio.sleep(0.05)
+        assert not any(m["type"] == "response.cancel" for m in ws.sent)
+        assert transport.stale_cancels_suppressed == 1
+        # Active response: exactly one cancel reaches the wire.
+        transport._dispatch_event({"type": "response.created", "response": {"id": "r1"}})
         transport.cancel_response_nowait()
         await asyncio.sleep(0.05)
         await transport.close()
-        assert any(m["type"] == "response.cancel" for m in ws.sent)
+        assert len([m for m in ws.sent if m["type"] == "response.cancel"]) == 1
 
     @pytest.mark.asyncio
     async def test_inject_item_and_function_output(self):

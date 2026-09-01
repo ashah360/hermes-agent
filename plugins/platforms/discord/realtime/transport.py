@@ -72,6 +72,13 @@ class RealtimeTransport:
         # that frame itself (it never reaches _dispatch_event), so it is
         # stored here for callers that need it (canary echo assertions).
         self.session_echo: dict = {}
+        # Response-generation tracking for stale-cancel suppression: a cancel
+        # is bound to the generation it was scheduled against and re-checked
+        # at ACTUAL send time — response.done racing a queued cancel must
+        # produce zero wire frames (live: response_cancel_not_active spam).
+        self._response_in_flight = False
+        self._response_gen = 0
+        self.stale_cancels_suppressed = 0
 
     # ------------------------------------------------------------------
     # Connect / bootstrap
@@ -218,6 +225,8 @@ class RealtimeTransport:
             elif ftype == "input_audio_buffer.speech_stopped":
                 lane.on_user_speech_stopped()
             elif ftype == "response.created":
+                self._response_in_flight = True
+                self._response_gen += 1
                 lane.on_response_created((frame.get("response") or {}).get("id"))
             elif ftype in ("response.output_audio.delta", "response.audio.delta"):
                 b64 = frame.get("delta") or frame.get("audio") or ""
@@ -238,6 +247,7 @@ class RealtimeTransport:
             elif ftype == "conversation.item.input_audio_transcription.completed":
                 lane.on_input_transcript(frame.get("transcript") or "")
             elif ftype in ("response.done", "response.completed", "response.cancelled"):
+                self._response_in_flight = False
                 lane.on_response_done()
             elif ftype == "response.function_call_arguments.done":
                 raw_args = frame.get("arguments") or "{}"
@@ -275,12 +285,33 @@ class RealtimeTransport:
         await self._send_json({"type": "input_audio_buffer.commit"})
 
     def cancel_response_nowait(self) -> None:
-        """Fire-and-forget response.cancel (barge-in hot path)."""
+        """Barge-in cancel, generation-bound and re-checked at SEND time.
+
+        The token captures the response generation at scheduling; the task
+        verifies — immediately before the websocket send — that the SAME
+        generation is still in flight. ``response.done`` winning the race
+        (or a newer response having started) suppresses the frame entirely,
+        so the provider never sees ``response_cancel_not_active``. A truly
+        active response is still cancelled within one loop turn (<300ms
+        barge-in preserved).
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._send_json({"type": "response.cancel"}))
+        token = self._response_gen
+        loop.create_task(self._send_cancel_if_active(token))
+
+    async def _send_cancel_if_active(self, token: int) -> None:
+        if not self._response_in_flight or self._response_gen != token:
+            self.stale_cancels_suppressed += 1
+            logger.info(
+                "realtime cancel suppressed at send time (stale generation "
+                "%d, current %d, in_flight=%s)",
+                token, self._response_gen, self._response_in_flight,
+            )
+            return
+        await self._send_json({"type": "response.cancel"})
 
     async def create_response(self, *, instructions: Optional[str] = None) -> None:
         response: dict = {}

@@ -45,9 +45,22 @@ class DiscordTextOutbox:
         loop = getattr(self._lane, "_loop", None)
         if not channel_id or adapter is None or loop is None:
             return None
-        try:
-            import asyncio
+        import asyncio
 
+        # Deadlock guard: run_coroutine_threadsafe(...).result() on the very
+        # loop it targets blocks forever. post_result is an executor-thread
+        # API; refuse (loudly) instead of hanging the event loop.
+        try:
+            if asyncio.get_running_loop() is loop:
+                logger.warning(
+                    "Realtime outbox post_result called on its own event "
+                    "loop (dispatch=%s) — refusing to block; post skipped",
+                    record.dispatch_id,
+                )
+                return None
+        except RuntimeError:
+            pass  # no running loop on this thread — the normal case
+        try:
             future = asyncio.run_coroutine_threadsafe(
                 adapter.send(str(channel_id), render_result(record, result)),
                 loop,

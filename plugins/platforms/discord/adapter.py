@@ -4341,6 +4341,12 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         for gid, text_ch_id in self._voice_text_channels.items():
             if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
+                if self.is_realtime_voice_active(gid):
+                    # Single-egress ownership: the realtime lane is the only
+                    # spoken source. Suppress (success — the reply text is
+                    # already delivered); never fall back to an attachment.
+                    self._log_realtime_egress_suppressed(gid, "play_tts")
+                    return SendResult(success=True)
                 logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
                 success = await self.play_in_voice_channel(gid, audio_path)
                 return SendResult(success=success)
@@ -4768,6 +4774,11 @@ class DiscordAdapter(BasePlatformAdapter):
         a turn, so the user hears "let me look into that" before the bot goes
         quiet to work.  No-op unless the mixer is installed and acks enabled.
         """
+        if self.is_realtime_voice_active(guild_id):
+            # Realtime lane owns acknowledgements (model-authored) — never
+            # synthesize a legacy canned ack alongside it.
+            self._log_realtime_egress_suppressed(guild_id, "play_ack_in_voice")
+            return False
         if not self._voice_fx_cfg.get("ack_enabled"):
             return False
         mixer = self._voice_mixers.get(guild_id)
@@ -4822,6 +4833,46 @@ class DiscordAdapter(BasePlatformAdapter):
         """True when a continuous mixer is installed for this guild."""
         mixers = getattr(self, "_voice_mixers", None)
         return bool(mixers) and mixers.get(guild_id) is not None
+
+    def is_realtime_voice_active(self, guild_id: int) -> bool:
+        """True ONLY when a realtime lane exists for the guild and owns audio.
+
+        Reads the lane's state by value string so the realtime package is
+        never imported when the feature is off. CASCADED/DEMOTING/stopped
+        lanes (and no lane at all) return False — legacy TTS keeps working
+        as the fallback there.
+        """
+        lanes = getattr(self, "_realtime_lanes", None)
+        if not lanes:
+            return False
+        lane = lanes.get(guild_id)
+        if lane is None:
+            return False
+        state = getattr(lane, "state", None)
+        return getattr(state, "value", None) == "realtime"
+
+    def is_realtime_voice_active_for_chat(self, chat_id) -> bool:
+        """Chat-scoped variant: True when *chat_id* is the bound text channel
+        of a guild whose realtime lane is active."""
+        for gid, text_ch in (getattr(self, "_voice_text_channels", None) or {}).items():
+            if str(text_ch) == str(chat_id) and self.is_realtime_voice_active(gid):
+                return True
+        return False
+
+    def _log_realtime_egress_suppressed(self, guild_id: int, path: str) -> None:
+        """Bounded ownership log: INFO once per (guild, path)."""
+        logged = getattr(self, "_realtime_egress_logged", None)
+        if logged is None:
+            logged = set()
+            self._realtime_egress_logged = logged
+        key = (guild_id, path)
+        if key in logged:
+            return
+        logged.add(key)
+        logger.info(
+            "discord_realtime egress_suppressed guild=%s path=%s "
+            "(realtime lane owns voice output)", guild_id, path,
+        )
 
     def interrupt_voice_playback(self, guild_id: int) -> bool:
         """Stop current speech immediately while keeping the VC mixer alive."""
@@ -4968,6 +5019,12 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
+            return False
+
+        if self.is_realtime_voice_active(guild_id):
+            # Hard backstop: NO legacy audio enters the VC while the realtime
+            # lane owns it, regardless of which caller got here.
+            self._log_realtime_egress_suppressed(guild_id, "play_in_voice_channel")
             return False
 
         # Playback is activity. Do not let the inactivity timer disconnect the

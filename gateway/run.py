@@ -24093,6 +24093,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is_voice_input = (event.message_type == MessageType.VOICE)
 
         adapter = self.adapters.get(event.source.platform)
+        # Single-egress ownership: while the realtime lane owns this chat's
+        # voice, NO legacy TTS is synthesized or played from the gateway —
+        # decided here, BEFORE any synthesis cost.
+        checker = getattr(adapter, "is_realtime_voice_active_for_chat", None)
+        if callable(checker):
+            try:
+                # `is True` on purpose: MagicMock adapters in older tests
+                # auto-create truthy attributes (same guard style as the
+                # draft_stream_is_message checks).
+                if checker(chat_id) is True:
+                    logger.info(
+                        "Auto voice reply suppressed: realtime lane owns chat %s",
+                        chat_id,
+                    )
+                    return False
+            except Exception:
+                pass
         adapter_auto_tts = False
         if adapter and hasattr(adapter, "_should_auto_tts_for_chat"):
             try:
@@ -24150,6 +24167,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
         actual_paths: List[str] = []
+        # Race defense: the realtime lane may have activated between the
+        # _should_send_voice_reply decision and this call — re-check before
+        # spending synthesis, and never play beside the lane.
+        try:
+            _rt_adapter = self._adapter_for_source(event.source)
+        except Exception:
+            _rt_adapter = None
+        _rt_checker = getattr(_rt_adapter, "is_realtime_voice_active_for_chat", None)
+        if callable(_rt_checker):
+            try:
+                # `is True` on purpose — see _should_send_voice_reply.
+                if _rt_checker(event.source.chat_id) is True:
+                    logger.info(
+                        "Voice reply suppressed pre-synthesis: realtime lane "
+                        "owns chat %s", event.source.chat_id,
+                    )
+                    return
+            except Exception:
+                pass
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 

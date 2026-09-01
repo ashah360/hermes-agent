@@ -45,6 +45,17 @@ _WORKER_RESULT_CONTRACT = (
 )
 
 
+def canonicalize_goal(goal: str) -> str:
+    """Deterministic goal identity for live-dispatch dedupe.
+
+    Casefold, strip punctuation, collapse whitespace — so "Check the
+    weather!!" and "check   the weather" are one live task.
+    """
+    lowered = (goal or "").casefold()
+    stripped = re.sub(r"[^\w\s]", " ", lowered)
+    return re.sub(r"\s+", " ", stripped).strip()
+
+
 @dataclass(frozen=True)
 class WorkerSpec:
     """Immutable dispatch-time snapshot handed to the child runner."""
@@ -55,6 +66,7 @@ class WorkerSpec:
     user_id: int
     guild_id: int
     text_channel_id: Optional[int]
+    max_iterations: int = 30
 
 
 class WorkerHooks:
@@ -159,6 +171,7 @@ def default_child_runner(spec: WorkerSpec, hooks: WorkerHooks, *, principal: Any
         goal=spec.goal + _WORKER_RESULT_CONTRACT,
         context_snapshot=spec.context_snapshot,
         principal=principal,
+        max_iterations=getattr(spec, "max_iterations", 30),
     )
     hooks.interrupt_fn(lambda: child.interrupt(reason="realtime lane cancel"))
 
@@ -234,16 +247,27 @@ class WorkerBridge:
             registry.revoke(supersedes_dispatch_id, reason="superseded")
             self.lane.telemetry.incr("dispatch_superseded")
 
-        if registry.live_count() >= self.lane.config.max_inflight_dispatches:
-            self.lane.telemetry.incr("dispatch_rejected_capacity")
-            return None
-
-        record = registry.register(
+        # Atomic dedupe + capacity + register: an equivalent RUNNING/BLOCKED
+        # goal is reused instead of spawning a second worker (live evidence:
+        # two identical weather dispatches 35s apart both ran and both spoke).
+        record, reused = registry.register_or_reuse(
             goal=task,
+            canonical_goal=canonicalize_goal(task),
             guild_id=self.lane.guild_id,
             text_channel_id=self.lane.text_channel_id,
             user_id=user_id,
+            max_live=self.lane.config.max_inflight_dispatches,
         )
+        if record is None:
+            self.lane.telemetry.incr("dispatch_rejected_capacity")
+            return None
+        if reused:
+            self.lane.telemetry.incr("dispatch_deduped")
+            logger.info(
+                "discord_realtime dispatch_deduped guild=%s dispatch=%s user=%s",
+                self.lane.guild_id, record.dispatch_id, user_id,
+            )
+            return record
         spec = WorkerSpec(
             dispatch_id=record.dispatch_id,
             goal=task,
@@ -251,6 +275,7 @@ class WorkerBridge:
             user_id=user_id,
             guild_id=self.lane.guild_id,
             text_channel_id=self.lane.text_channel_id,
+            max_iterations=self.lane.config.worker_max_iterations,
         )
         hooks = WorkerHooks(self, record)
         logger.info(

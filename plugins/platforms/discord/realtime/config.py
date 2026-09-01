@@ -39,6 +39,13 @@ class RealtimeVoiceConfig:
     # audio.input.turn_detection type. Production default is semantic_vad;
     # "none" disables VAD (JSON null) for manual-commit sessions (canary).
     turn_detection_type: str = "semantic_vad"
+    # Worker performance knobs: SAME model/provider as the session (never a
+    # quality downgrade) — speed comes from low reasoning effort, priority
+    # service tier, and a bounded iteration budget. Scoped to realtime voice
+    # workers only; normal text agents and global delegation are untouched.
+    worker_reasoning_effort: str = "low"
+    worker_service_tier: str = "priority"
+    worker_max_iterations: int = 30
     # Exact sourced-synthesis TTS path (ADR D13).
     synthesis_tts_model: str = "gpt-4o-mini-tts"
     synthesis_voice: str = "cedar"
@@ -73,6 +80,14 @@ def _as_str(value: Any, default: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return default
+
+
+_VALID_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+
+
+def _validated_effort(value: Any, default: str) -> str:
+    effort = _as_str(value, default).lower()
+    return effort if effort in _VALID_EFFORTS else default
 
 
 def load_realtime_voice_config(raw: Optional[Mapping[str, Any]]) -> RealtimeVoiceConfig:
@@ -119,6 +134,16 @@ def load_realtime_voice_config(raw: Optional[Mapping[str, Any]]) -> RealtimeVoic
         turn_detection_type=_as_str(
             raw.get("turn_detection_type"), defaults.turn_detection_type
         ).lower(),
+        worker_reasoning_effort=_validated_effort(
+            raw.get("worker_reasoning_effort"), defaults.worker_reasoning_effort
+        ),
+        worker_service_tier=_as_str(
+            raw.get("worker_service_tier"), defaults.worker_service_tier
+        ).lower(),
+        worker_max_iterations=min(
+            500,
+            _as_int(raw.get("worker_max_iterations"), defaults.worker_max_iterations, 1),
+        ),
         synthesis_tts_model=_as_str(
             synthesis.get("tts_model"), defaults.synthesis_tts_model
         ),

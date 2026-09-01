@@ -254,3 +254,35 @@ class TestInterruptVoicePlayback:
     def test_false_when_nothing_playing(self):
         adapter = _make_adapter()
         assert adapter.interrupt_voice_playback(111) is False
+
+
+class TestRealtimeIdleSilence:
+    """Live regression: idle echo/noise came from the ambient bed being
+    attached even when the mixer exists solely for the realtime lane."""
+
+    @pytest.mark.asyncio
+    async def test_realtime_mixer_installs_without_ambient(self):
+        adapter = _make_adapter()  # voice_fx enabled with ambient defaults
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        with patch.object(
+            type(adapter), "_realtime_voice_enabled", return_value=True
+        ):
+            await adapter._install_voice_mixer(111, vc)
+        mixer = adapter._voice_mixers[111]
+        # No ambient bed: idle output is pure silence, regardless of voice_fx.
+        assert mixer._ambient is None
+        for _ in range(5):
+            assert mixer.read() == vm.SILENCE_FRAME
+
+    @pytest.mark.asyncio
+    async def test_legacy_voice_fx_ambient_unchanged_when_realtime_off(self):
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        with patch.object(
+            type(adapter), "_realtime_voice_enabled", return_value=False
+        ):
+            await adapter._install_voice_mixer(111, vc)
+        mixer = adapter._voice_mixers[111]
+        assert mixer._ambient is not None

@@ -675,13 +675,30 @@ def _principal_provider_for(adapter: Any, lane: "RealtimeVoiceLane"):
             return None
         speaker = getattr(lane, "last_speaker_user_id", 0) or 0
         try:
-            return build(
+            principal = build(
                 chat_id=str(lane.text_channel_id or ""),
                 user_id=str(speaker) if speaker else None,
             )
         except Exception:
             logger.warning("realtime worker principal build failed", exc_info=True)
             return None
+        if principal is None:
+            return None
+        # Worker performance shaping (config-scoped to realtime voice
+        # workers): SAME model/provider — speed via low reasoning effort +
+        # priority service tier, merged over the session's own overrides.
+        cfg = lane.config
+        try:
+            principal.reasoning_config = {
+                "enabled": True,
+                "effort": cfg.worker_reasoning_effort,
+            }
+            overrides = dict(getattr(principal, "request_overrides", None) or {})
+            overrides["service_tier"] = cfg.worker_service_tier
+            principal.request_overrides = overrides
+        except Exception:
+            logger.debug("worker principal perf shaping failed", exc_info=True)
+        return principal
 
     return _provider
 

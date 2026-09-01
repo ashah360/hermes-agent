@@ -50,6 +50,10 @@ class DispatchRecord:
     interrupt_fn: Optional[Callable[[], None]] = None
     delivered_terminal: bool = False
     delivered_keys: set = field(default_factory=set)
+    canonical_goal: str = ""
+    # True once at least one duplicate dispatch call was answered with this
+    # record instead of spawning a second worker (live-goal dedupe).
+    reused: bool = False
 
 
 class DispatchRegistry:
@@ -70,6 +74,7 @@ class DispatchRegistry:
         guild_id: int,
         text_channel_id: Optional[int],
         user_id: int,
+        canonical_goal: str = "",
     ) -> DispatchRecord:
         record = DispatchRecord(
             dispatch_id=f"disp-{uuid.uuid4().hex[:10]}",
@@ -79,10 +84,57 @@ class DispatchRegistry:
             text_channel_id=text_channel_id,
             user_id=user_id,
             created_at=self._clock(),
+            canonical_goal=canonical_goal,
         )
         with self._lock:
             self._records[record.dispatch_id] = record
         return record
+
+    def register_or_reuse(
+        self,
+        *,
+        goal: str,
+        canonical_goal: str,
+        guild_id: int,
+        text_channel_id: Optional[int],
+        user_id: int,
+        max_live: int,
+    ) -> Tuple[Optional[DispatchRecord], bool]:
+        """Atomic live-goal dedupe + capacity check + registration.
+
+        One lock hold covers the equivalent-live-record scan, the capacity
+        check, and the insert, so two simultaneous identical dispatches can
+        never both create a worker. Returns ``(record, reused)``;
+        ``(None, False)`` means capacity rejection.
+        """
+        with self._lock:
+            if canonical_goal:
+                for existing in self._records.values():
+                    if (
+                        existing.status in ("running", "blocked")
+                        and not existing.voice_revoked
+                        and existing.canonical_goal == canonical_goal
+                    ):
+                        existing.reused = True
+                        return existing, True
+            live = sum(
+                1 for r in self._records.values()
+                if r.status in ("running", "blocked") and not r.voice_revoked
+            )
+            if live >= max_live:
+                return None, False
+            record = DispatchRecord(
+                dispatch_id=f"disp-{uuid.uuid4().hex[:10]}",
+                epoch=self.epoch,
+                goal=goal,
+                guild_id=guild_id,
+                text_channel_id=text_channel_id,
+                user_id=user_id,
+                created_at=self._clock(),
+                canonical_goal=canonical_goal,
+            )
+            self._records[record.dispatch_id] = record
+            return record, False
 
     def get(self, dispatch_id: str) -> Optional[DispatchRecord]:
         with self._lock:

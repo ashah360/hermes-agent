@@ -4589,7 +4589,14 @@ class DiscordAdapter(BasePlatformAdapter):
             duck_gain=float(self._voice_fx_cfg.get("duck_gain", 0.06)),
             speech_gain=float(self._voice_fx_cfg.get("speech_gain", 1.0)),
         )
-        ambient = await asyncio.to_thread(self._get_ambient_pcm)
+        # The realtime lane requires the mixer as its output path but must be
+        # SILENT while idle: no ambient bed regardless of voice_fx settings
+        # (live users heard the synthesized idle pad as echo/noise). Legacy
+        # voice_fx ambient behavior is unchanged when the realtime flag is
+        # off.
+        ambient = None
+        if not self._realtime_voice_enabled():
+            ambient = await asyncio.to_thread(self._get_ambient_pcm)
         if ambient:
             mixer.set_ambient(ambient)
 

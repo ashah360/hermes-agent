@@ -131,15 +131,36 @@ def _voice_context(lane: Any) -> dict:
     return out
 
 
+def _still_working_payload(record: Any) -> dict:
+    return {
+        "status": record.status,   # running | blocked
+        "dispatch_id": record.dispatch_id,
+        "task": record.goal,
+        "instruction": (
+            "This task is already in progress. Do NOT dispatch the same goal "
+            "again — its progress and result will be delivered to you as "
+            "events. Tell the user it's still being worked on."
+        ),
+    }
+
+
 def _recall_result(lane: Any, dispatch_id: Any) -> dict:
     completed = lane.registry.completed_records()
     record = None
     if dispatch_id:
-        record = lane.registry.get(str(dispatch_id))
-        if record is None or record.status != "completed":
-            record = None
+        requested = lane.registry.get(str(dispatch_id))
+        # A running/blocked match must be reported as such — returning
+        # no_result here is what invited the duplicate live dispatch.
+        if requested is not None and requested.status in ("running", "blocked"):
+            return _still_working_payload(requested)
+        if requested is not None and requested.status == "completed":
+            record = requested
     elif completed:
         record = max(completed, key=lambda r: r.created_at)
+    else:
+        live = lane.registry.live_records()
+        if live:
+            return _still_working_payload(max(live, key=lambda r: r.created_at))
     if record is None:
         return {
             "status": "no_result",

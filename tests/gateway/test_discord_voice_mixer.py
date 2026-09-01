@@ -172,11 +172,12 @@ class TestStreamingMixerChild:
     def _frame(self, value=1000):
         return np.full(vm.SAMPLES_PER_FRAME * vm.CHANNELS, value, dtype=np.int16).tobytes()
 
-    def test_plays_fed_audio_through_mixer(self):
+    def test_plays_fed_audio_through_mixer_after_prebuffer(self):
         mx = vm.VoiceMixer()
         child = vm.StreamingMixerChild("realtime")
         mx.attach_stream(child)
-        child.feed(self._frame() * 2)
+        frames_to_prime = vm.STREAM_PREBUFFER_MS // vm.FRAME_LENGTH_MS
+        child.feed(self._frame() * (frames_to_prime + 1))
         out1 = np.frombuffer(mx.read(), dtype=np.int16)
         out2 = np.frombuffer(mx.read(), dtype=np.int16)
         assert int(np.max(np.abs(out1))) > 0
@@ -186,11 +187,16 @@ class TestStreamingMixerChild:
         mx = vm.VoiceMixer()
         child = vm.StreamingMixerChild("realtime")
         mx.attach_stream(child)
-        child.feed(self._frame())
+        frames_to_prime = vm.STREAM_PREBUFFER_MS // vm.FRAME_LENGTH_MS
+        child.feed(self._frame() * frames_to_prime)
         assert int(np.max(np.abs(np.frombuffer(mx.read(), dtype=np.int16)))) > 0
-        # Starving (no data, not ended): silence but child stays attached.
+        # Drain the rest, then starve: silence but child stays attached.
+        for _ in range(frames_to_prime - 1):
+            mx.read()
         assert mx.read() == vm.SILENCE_FRAME
-        child.feed(self._frame())
+        # Rebuffer target (smaller than startup) resumes playback.
+        rebuffer_frames = vm.STREAM_REBUFFER_MS // vm.FRAME_LENGTH_MS
+        child.feed(self._frame() * rebuffer_frames)
         assert int(np.max(np.abs(np.frombuffer(mx.read(), dtype=np.int16)))) > 0
 
     def test_clear_drops_queued_audio_within_one_frame(self):
@@ -226,6 +232,8 @@ class TestStreamingMixerChild:
         # Not a full frame yet -> silence, but bytes retained.
         assert mx.read() == vm.SILENCE_FRAME
         child.feed(half)
+        # Sub-prebuffer + explicit finish: residual drains, nothing lost.
+        child.finish()
         assert int(np.max(np.abs(np.frombuffer(mx.read(), dtype=np.int16)))) > 0
 
     def test_pending_ms_reports_queue_depth(self):
@@ -286,3 +294,158 @@ class TestRealtimeIdleSilence:
             await adapter._install_voice_mixer(111, vc)
         mixer = adapter._voice_mixers[111]
         assert mixer._ambient is not None
+
+
+class TestStreamJitterBuffer:
+    """Adaptive prebuffer for bursty Realtime deltas (live choppiness fix).
+
+    Deterministic read/feed schedules only — no sleeps, no wall clock."""
+
+    def _frame(self, value=1000):
+        return np.full(vm.SAMPLES_PER_FRAME * vm.CHANNELS, value, dtype=np.int16).tobytes()
+
+    def _pattern_frame(self, i):
+        # Distinct nonzero content per frame so order/loss is provable.
+        return np.full(
+            vm.SAMPLES_PER_FRAME * vm.CHANNELS, 100 + (i % 200), dtype=np.int16
+        ).tobytes()
+
+    def test_startup_threshold_no_audio_before_target(self):
+        child = vm.StreamingMixerChild("rt")
+        below = (vm.STREAM_PREBUFFER_MS // vm.FRAME_LENGTH_MS) - 1
+        child.feed(self._frame() * below)
+        # Still buffering: silence frames, never real audio, never finished.
+        for _ in range(3):
+            frame = child.read_frame()
+            assert frame is not None
+            assert int(np.max(np.abs(frame))) == 0
+        child.feed(self._frame())  # reaches target
+        assert int(np.max(np.abs(child.read_frame()))) > 0
+
+    def test_finish_below_target_drains_tail_and_ends_cleanly(self):
+        child = vm.StreamingMixerChild("rt")
+        child.feed(self._frame() * 2)  # 40ms < target
+        child.finish()
+        assert int(np.max(np.abs(child.read_frame()))) > 0
+        assert int(np.max(np.abs(child.read_frame()))) > 0
+        assert child.read_frame() is None      # ended exactly once, no zombie
+        assert child.finished is True
+
+    def _run_schedule(self, feed_plan, total_reads):
+        """Drive the real child on a deterministic feed/read schedule."""
+        child = vm.StreamingMixerChild("rt")
+        fed = []
+        frame_index = 0
+        outputs = []
+        for tick in range(total_reads):
+            for _ in range(feed_plan(tick)):
+                pcm = self._pattern_frame(frame_index)
+                fed.append(pcm)
+                frame_index += 1
+                child.feed(pcm)
+            frame = child.read_frame()
+            assert frame is not None  # never finishes mid-stream
+            outputs.append(frame)
+        child.finish()
+        while True:
+            frame = child.read_frame()
+            if frame is None:
+                break
+            outputs.append(frame)
+        emissions = [
+            "audio" if int(np.max(np.abs(f))) > 0 else "silence" for f in outputs
+        ]
+        transitions = sum(1 for a, b in zip(emissions, emissions[1:]) if a != b)
+        audio_bytes = b"".join(
+            f.astype(np.int16).tobytes()
+            for f in outputs if int(np.max(np.abs(f))) > 0
+        )
+        return emissions, transitions, audio_bytes, b"".join(fed)
+
+    @staticmethod
+    def _old_model_transitions(feed_plan, total_reads):
+        """The pre-fix algorithm: emit whenever >=1 frame is buffered."""
+        transitions = 0
+        depth = 0
+        last = None
+        for tick in range(total_reads):
+            depth += feed_plan(tick)
+            emitted = "audio" if depth >= 1 else "silence"
+            if depth >= 1:
+                depth -= 1
+            if last is not None and emitted != last:
+                transitions += 1
+            last = emitted
+        return transitions
+
+    def test_sufficient_delivery_with_jitter_has_zero_gaps_after_start(self):
+        """Phase-jittered deltas whose running deficit stays under the
+        prebuffer: once speech begins there must be NO hard-zero frames."""
+        def feed_plan(tick):
+            if tick < 5:
+                return 2                      # startup burst primes quickly
+            return 2 if (tick % 2) else 0     # then jittered 1.0x average
+
+        emissions, transitions, audio_bytes, fed_bytes = self._run_schedule(
+            feed_plan, 120
+        )
+        first_audio = emissions.index("audio")
+        assert "silence" not in emissions[first_audio:]
+        assert transitions == 1               # exactly one silence→audio
+        assert audio_bytes == fed_bytes       # order preserved, zero loss
+
+    def test_deficit_bursts_consolidate_transitions_at_least_3x(self):
+        """The live choppiness shape: stretches where deltas arrive slower
+        than playback (0.5x) with periodic catch-up bursts. The old
+        algorithm alternated audio/silence on every late frame; the jitter
+        buffer must consolidate gaps into >=3x fewer transitions with zero
+        sample loss."""
+        def feed_plan(tick):
+            burst = 5 if tick % 20 == 19 else 0
+            slow = 1 if tick % 2 == 0 else 0
+            return slow + burst
+
+        total = 160
+        old_transitions = self._old_model_transitions(feed_plan, total)
+        emissions, new_transitions, audio_bytes, fed_bytes = self._run_schedule(
+            feed_plan, total
+        )
+        assert old_transitions >= 30          # the fixture really is choppy
+        assert new_transitions * 3 <= old_transitions
+        assert audio_bytes == fed_bytes       # consolidation loses nothing
+
+    def test_bounded_buffer_drops_newest_and_counts(self):
+        child = vm.StreamingMixerChild("rt")
+        cap_frames = vm.STREAM_MAX_BUFFER_MS // vm.FRAME_LENGTH_MS
+        child.feed(self._frame() * (cap_frames + 50))
+        assert child.pending_ms() <= vm.STREAM_MAX_BUFFER_MS
+        assert child.stats["overrun_dropped_bytes"] >= 50 * vm.FRAME_SIZE
+
+    def test_underrun_and_rebuffer_counters(self):
+        child = vm.StreamingMixerChild("rt")
+        prime = vm.STREAM_PREBUFFER_MS // vm.FRAME_LENGTH_MS
+        child.feed(self._frame() * prime)
+        for _ in range(prime):
+            child.read_frame()          # drain fully
+        assert int(np.max(np.abs(child.read_frame()))) == 0  # underrun
+        assert child.stats["underruns"] == 1
+        assert child.stats["max_depth_ms"] >= vm.STREAM_PREBUFFER_MS
+
+    def test_clear_discards_and_ends_within_one_frame(self):
+        mx = vm.VoiceMixer()
+        child = vm.StreamingMixerChild("rt")
+        mx.attach_stream(child)
+        prime = vm.STREAM_PREBUFFER_MS // vm.FRAME_LENGTH_MS
+        child.feed(self._frame() * (prime * 3))
+        assert int(np.max(np.abs(np.frombuffer(mx.read(), dtype=np.int16)))) > 0
+        child.clear()
+        # Immediate: very next mixer frame is silence and the child is done.
+        assert mx.read() == vm.SILENCE_FRAME
+        assert child.finished is True
+
+    def test_legacy_fixed_clip_child_unaffected(self):
+        # MixerChild (fixed clips: acks, cascaded TTS) has NO prebuffer:
+        # first frame plays immediately, exactly as before.
+        clip = vm.MixerChild("ack", self._frame() * 2)
+        first = clip.read_frame()
+        assert int(np.max(np.abs(first))) > 0

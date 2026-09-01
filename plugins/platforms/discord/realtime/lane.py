@@ -381,10 +381,26 @@ class RealtimeVoiceLane:
             len(self._pending_injections),
         )
 
+    def _absorb_stream_stats(self, child: Any) -> None:
+        """Fold the finished child's jitter counters into lane telemetry."""
+        stats = getattr(child, "stats", None)
+        if not isinstance(stats, dict):
+            return
+        for key in ("underruns", "rebuffers", "transitions"):
+            if stats.get(key):
+                self.telemetry.incr(f"stream_{key}", int(stats[key]))
+        if stats.get("overrun_dropped_bytes"):
+            self.telemetry.incr(
+                "stream_overrun_dropped_bytes", int(stats["overrun_dropped_bytes"])
+            )
+        if stats.get("max_depth_ms"):
+            self.telemetry.gauge("stream_max_depth_ms", float(stats["max_depth_ms"]))
+
     def on_response_done(self) -> None:
         child = self._stream_child
         if child is not None:
-            child.end()
+            child.finish()
+            self._absorb_stream_stats(child)
             self._stream_child = None
         if self._output_transcript_parts:
             self.note_transcript("assistant", "".join(self._output_transcript_parts))
@@ -674,8 +690,8 @@ class RealtimeVoiceLane:
     def _clear_playback(self) -> None:
         child = self._stream_child
         if child is not None:
-            child.clear()
-            child.end()
+            child.clear()  # discards AND marks done (barge-in contract)
+            self._absorb_stream_stats(child)
             self._stream_child = None
         adapter = self._adapter
         if adapter is not None and hasattr(adapter, "interrupt_voice_playback"):

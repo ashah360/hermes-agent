@@ -153,25 +153,57 @@ class MixerChild:
         return samples
 
 
+# ── Streaming jitter/prebuffer defaults (realtime lane + exact TTS) ──
+# Realtime WS audio deltas are BURSTY: draining frame-by-frame as they land
+# alternates one audio frame / one hard-zero frame during gaps — heard live
+# as rapid pauses. The streaming child therefore prebuffers before draining
+# and re-buffers after an underflow instead of stuttering.
+STREAM_PREBUFFER_MS = 100   # startup target before playback (added latency)
+STREAM_REBUFFER_MS = 60     # replenish target after a mid-stream underflow
+STREAM_MAX_BUFFER_MS = 30000  # hard memory bound (~5.7 MB); overrun drops
+
+
 class StreamingMixerChild:
     """A continuous PCM stream child for :class:`VoiceMixer`.
 
-    Unlike :class:`MixerChild` (one fixed clip), this child is fed arbitrary
-    48 kHz / stereo / s16le PCM incrementally (``feed``) — realtime-API audio
-    deltas or streamed TTS chunks — and stays alive through starvation gaps
-    (returning silence) until :meth:`end` is called and the buffer drains.
+    Unlike :class:`MixerChild` (one fixed clip, plays immediately —
+    unchanged), this child is fed arbitrary 48 kHz / stereo / s16le PCM
+    incrementally (``feed``) and runs a small bounded jitter buffer:
 
-    ``clear()`` drops all queued audio immediately: the very next mixer frame
-    is silence, bounding in-process barge-in latency to one 20 ms frame.
+    - BUFFERING: silence until ``prebuffer_ms`` of audio is queued (or the
+      stream is finished with less — the tail always drains);
+    - PLAYING: continuous drain, exact sample order, no loss;
+    - underflow: back to BUFFERING with the smaller ``rebuffer_ms`` target —
+      one silence gap per episode instead of per-frame stutter.
 
-    Thread safety: ``feed``/``clear``/``end`` are called from the asyncio loop
-    thread while ``read_frame`` runs on discord.py's sender thread; all shared
-    state is guarded by a lock.
+    ``finish()`` (alias ``end()``) marks the stream complete; residual audio
+    below the target drains, then the child finishes exactly once.
+    ``clear()`` discards everything immediately AND marks the stream done:
+    the very next mixer frame is silence (barge-in ≤ one 20 ms frame).
+
+    Buffered audio is capped at ``max_buffer_ms``; overruns drop the NEWEST
+    bytes (queued audio keeps playing in order) and are counted in
+    ``stats['overrun_dropped_bytes']``. All counters are privacy-safe
+    (counts/bytes only). Thread safety: producers run on the asyncio loop
+    thread, ``read_frame`` on discord.py's sender thread; a lock guards all
+    shared state and never blocks on I/O.
     """
 
-    __slots__ = ("name", "gain", "is_speech", "_lock", "_buf", "_ended", "_finished")
+    __slots__ = (
+        "name", "gain", "is_speech", "_lock", "_buf", "_ended", "_finished",
+        "_state", "_prebuffer_bytes", "_rebuffer_bytes", "_max_bytes",
+        "stats", "_last_emit",
+    )
 
-    def __init__(self, name: str, *, gain: float = 1.0):
+    def __init__(
+        self,
+        name: str,
+        *,
+        gain: float = 1.0,
+        prebuffer_ms: int = STREAM_PREBUFFER_MS,
+        rebuffer_ms: int = STREAM_REBUFFER_MS,
+        max_buffer_ms: int = STREAM_MAX_BUFFER_MS,
+    ):
         self.name = name
         self.gain = float(gain)
         self.is_speech = True
@@ -179,54 +211,106 @@ class StreamingMixerChild:
         self._buf = bytearray()
         self._ended = False
         self._finished = False
+        self._state = "buffering"
+        self._prebuffer_bytes = max(0, int(prebuffer_ms)) * BYTES_PER_MS
+        self._rebuffer_bytes = max(0, int(rebuffer_ms)) * BYTES_PER_MS
+        self._max_bytes = max(FRAME_SIZE, int(max_buffer_ms) * BYTES_PER_MS)
+        self.stats = {
+            "underruns": 0,
+            "rebuffers": 0,
+            "overrun_dropped_bytes": 0,
+            "max_depth_ms": 0,
+            "transitions": 0,
+        }
+        self._last_emit: Optional[str] = None
 
     @property
     def finished(self) -> bool:
         return self._finished
 
     def feed(self, pcm: bytes) -> None:
-        """Append PCM bytes (any length; framing is handled internally)."""
+        """Append PCM bytes (any length); bounded by ``max_buffer_ms``."""
         if not pcm:
             return
         with self._lock:
-            if not self._ended:
-                self._buf.extend(pcm)
+            if self._ended:
+                return
+            room = self._max_bytes - len(self._buf)
+            if room <= 0:
+                self.stats["overrun_dropped_bytes"] += len(pcm)
+                return
+            if len(pcm) > room:
+                self.stats["overrun_dropped_bytes"] += len(pcm) - room
+                pcm = pcm[:room]
+            self._buf.extend(pcm)
+            depth_ms = (len(self._buf) // FRAME_SIZE) * FRAME_LENGTH_MS
+            if depth_ms > self.stats["max_depth_ms"]:
+                self.stats["max_depth_ms"] = depth_ms
 
     def clear(self) -> None:
-        """Drop all queued audio immediately (barge-in)."""
+        """Barge-in: discard everything immediately and mark done."""
         with self._lock:
             self._buf.clear()
+            self._ended = True
 
     def end(self) -> None:
         """Mark the stream complete; the child finishes once drained."""
         with self._lock:
             self._ended = True
 
+    # GA name for the same semantics; response-audio completion calls this.
+    finish = end
+
     def pending_ms(self) -> int:
         """Queued audio depth in whole frames, in milliseconds."""
         with self._lock:
             return (len(self._buf) // FRAME_SIZE) * FRAME_LENGTH_MS
+
+    def _note_emit(self, kind: str) -> None:
+        if self._last_emit is not None and self._last_emit != kind:
+            self.stats["transitions"] += 1
+        self._last_emit = kind
 
     def read_frame(self) -> "Optional[np.ndarray]":
         np = _require_numpy()
         with self._lock:
             if self._finished:
                 return None
-            if len(self._buf) >= FRAME_SIZE:
+            depth = len(self._buf)
+
+            if self._state == "buffering":
+                if self._ended:
+                    if depth == 0:
+                        self._finished = True
+                        return None
+                    self._state = "playing"   # drain the sub-target tail
+                elif depth >= self._prebuffer_bytes:
+                    self._state = "playing"
+                else:
+                    self._note_emit("silence")
+                    return np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
+
+            # PLAYING
+            if depth >= FRAME_SIZE:
                 chunk = bytes(self._buf[:FRAME_SIZE])
                 del self._buf[:FRAME_SIZE]
             elif self._ended:
-                if self._buf:
-                    chunk = bytes(self._buf) + b"\x00" * (FRAME_SIZE - len(self._buf))
+                if depth:
+                    chunk = bytes(self._buf) + b"\x00" * (FRAME_SIZE - depth)
                     self._buf.clear()
                 else:
                     self._finished = True
                     return None
             else:
-                # Starving mid-stream: keep the child (and the duck) alive.
-                chunk = None
-        if chunk is None:
-            return np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
+                # Mid-stream underflow: one rebuffer episode, not a stutter.
+                self.stats["underruns"] += 1
+                self.stats["rebuffers"] += 1
+                self._state = "buffering"
+                self._prebuffer_bytes = self._rebuffer_bytes
+                self._note_emit("silence")
+                return np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
+
+            self._note_emit("audio")
         samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
         if self.gain != 1.0:
             samples = samples * self.gain

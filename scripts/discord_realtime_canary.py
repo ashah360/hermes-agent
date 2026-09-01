@@ -242,6 +242,37 @@ async def _text_turn(transport, probe, timeout: float) -> dict:
     return {"ok": ok, "first_audio_ms": first_ms}
 
 
+async def _vad_audio_turn(transport, probe, timeout: float,
+                          silence_ms: int = 520, *, pace: bool = True) -> dict:
+    """Auto-VAD turn modeling REAL Discord behavior: finite speech packets,
+    then packet cessation — no further input except the zero tail the lane's
+    silence-tail machinery appends (Discord stops RTP after a speaker goes
+    quiet, so server VAD only closes the turn if that tail lands). No manual
+    commit, no manual response.create: server VAD owns the turn.
+    """
+    probe.reset_turn()
+    pcm = _synth_speech_like_pcm()
+    chunk = 4800  # 100ms of 24kHz mono pcm16
+    for i in range(0, len(pcm), chunk):
+        await transport.append_audio(pcm[i:i + chunk])
+        if pace:
+            await asyncio.sleep(0.1)
+    speech_end = time.monotonic()
+    # The lane's silence tail (discord_input_idle_ms then zeros exceeding
+    # server_vad_silence_duration_ms), modeled exactly.
+    if pace:
+        await asyncio.sleep(0.35)
+    await transport.append_audio(b"\x00" * (silence_ms * 48))
+    ok = await _wait(probe.first_audio_event, timeout)
+    first_ms = (probe.first_audio_at - speech_end) * 1000.0 if ok else None
+    stopped_ms = (
+        (probe.speech_stopped_at - speech_end) * 1000.0
+        if probe.speech_stopped_at else None
+    )
+    await _wait(probe.done_event, timeout)
+    return {"ok": ok, "first_audio_ms": first_ms, "speech_stopped_ms": stopped_ms}
+
+
 async def _manual_audio_turn(transport, probe, timeout: float, *, pace: bool = True) -> dict:
     """Real audio turn on a MANUAL-VAD session (turn_detection: null).
 
@@ -339,6 +370,10 @@ async def run_canary(args) -> int:
     try:
         text_turns = [await _text_turn(transport, probe, args.timeout)
                       for _ in range(args.turns)]
+        # Auto-VAD turns: finite speech packets then cessation + lane-style
+        # zero tail — the exact live Discord shape.
+        vad_turns = [await _vad_audio_turn(transport, probe, args.timeout)
+                     for _ in range(max(1, args.turns // 2))]
         interruption = await _interruption_turn(transport, probe, args.timeout)
     finally:
         seen_events |= transport.seen_event_types
@@ -376,6 +411,12 @@ async def run_canary(args) -> int:
     manual_errors = list(manual_probe.errors)
 
     report["checks"]["text_turn_first_audio"] = _summ(text_turns)
+    report["checks"]["vad_turn_first_audio"] = _summ(vad_turns)
+    report["checks"]["vad_turn_speech_stopped"] = {
+        "samples": len([t for t in vad_turns if t.get("speech_stopped_ms")]),
+        "values_ms": [round(t["speech_stopped_ms"], 1) for t in vad_turns
+                      if t.get("speech_stopped_ms")],
+    }
     report["checks"]["audio_turn_first_audio"] = _summ(audio_turns)
     report["checks"]["interruption"] = interruption
     report["audio_bytes_received"] = semantic_audio_bytes + manual_probe.audio_bytes
@@ -399,6 +440,8 @@ async def run_canary(args) -> int:
 
     if not report["checks"]["text_turn_first_audio"].get("ok"):
         failures.append("text turn produced no audio")
+    if not report["checks"]["vad_turn_first_audio"].get("ok"):
+        failures.append("auto-VAD turn (speech + cessation tail) produced no audio")
     if not report["checks"]["audio_turn_first_audio"].get("ok"):
         failures.append("audio turn produced no audio")
     if not interruption.get("ok"):

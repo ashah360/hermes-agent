@@ -47,6 +47,16 @@ class RealtimeVoiceConfig:
     server_vad_threshold: float = 0.5
     server_vad_prefix_padding_ms: int = 300
     server_vad_silence_duration_ms: int = 500
+    # Discord stops sending a speaker's RTP a few Opus silence frames after
+    # they stop talking, freezing the provider's audio timeline mid-turn —
+    # server VAD then never accumulates its silence window and the turn
+    # never closes (live: counters froze, no speech_stopped for minutes).
+    # After this much wall-clock input inactivity the lane appends an
+    # explicit zero-PCM tail (> server_vad_silence_duration_ms) so the turn
+    # completes. 350ms default: comfortably above Discord's own silence-
+    # frame cutoff and inter-packet jitter, below natural between-sentence
+    # pauses' impact (the VAD window itself still governs turn end).
+    discord_input_idle_ms: int = 350
     # Worker performance knobs: SAME model/provider as the session (never a
     # quality downgrade) — speed comes from low reasoning effort, priority
     # service tier, and a bounded iteration budget. Scoped to realtime voice
@@ -158,6 +168,13 @@ def load_realtime_voice_config(raw: Optional[Mapping[str, Any]]) -> RealtimeVoic
             _as_int(
                 raw.get("server_vad_silence_duration_ms"),
                 defaults.server_vad_silence_duration_ms, 50,
+            ),
+        ),
+        discord_input_idle_ms=min(
+            2000,
+            _as_int(
+                raw.get("discord_input_idle_ms"),
+                defaults.discord_input_idle_ms, 100,
             ),
         ),
         worker_reasoning_effort=_validated_effort(

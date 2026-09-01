@@ -90,6 +90,13 @@ class RealtimeVoiceLane:
         self._demotion_buffer_bytes = 0
         self._demoted = False
 
+        # ── Discord-input silence tail (server_vad transport completion) ──
+        # Discord stops the speaker's RTP shortly after they stop talking;
+        # the tail converts that packet cessation into explicit zero PCM on
+        # the provider timeline so server VAD can close the turn.
+        self._input_gen = 0
+        self._silence_tail_task: Optional[asyncio.Task] = None
+
         # ── Dispatch registry (ownership epochs; ADR D8) ──
         from .events import DispatchRegistry
 
@@ -216,6 +223,7 @@ class RealtimeVoiceLane:
         if self._pump_task is not None:
             self._pump_task.cancel()
             self._pump_task = None
+        self._cancel_silence_tail()
         self._clear_playback()
         self._response_owner = None
         self._provider_response_active = False
@@ -282,6 +290,7 @@ class RealtimeVoiceLane:
             try:
                 await self.transport.append_audio(discord_pcm_to_realtime(pcm))
                 self.telemetry.incr("appended_frames")
+                self._note_input_activity()
                 if not getattr(self, "_logged_first_append", False):
                     self._logged_first_append = True
                     logger.info(
@@ -299,6 +308,63 @@ class RealtimeVoiceLane:
                     )
         elif self.state is LaneState.DEMOTING:
             self._buffer_for_demotion(user_id, pcm)
+
+    # ------------------------------------------------------------------
+    # Silence tail: Discord packet cessation → explicit provider silence
+    # ------------------------------------------------------------------
+
+    def _note_input_activity(self) -> None:
+        """Advance the input generation and (re)schedule the ONE tail task.
+
+        Runs on the pump (loop thread) after each accepted append — the
+        receive path itself (SocketReader thread) is never blocked. Scoped
+        to server_vad: semantic VAD closes turns semantically and manual
+        mode commits explicitly, so a tail there is unnecessary.
+        """
+        if self.config.turn_detection_type != "server_vad":
+            return
+        self._input_gen += 1
+        task = self._silence_tail_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._silence_tail_task = asyncio.ensure_future(
+            self._silence_tail_after_idle(self._input_gen)
+        )
+
+    async def _silence_tail_after_idle(self, gen: int) -> None:
+        try:
+            await asyncio.sleep(self.config.discord_input_idle_ms / 1000.0)
+        except asyncio.CancelledError:
+            return
+        # Emit only if this generation is still current (no new frames), the
+        # lane still owns audio, and the provider socket is alive.
+        if self._stopped or self.state is not LaneState.REALTIME:
+            return
+        if gen != self._input_gen:
+            return
+        transport = self.transport
+        if transport is None:
+            return
+        # Exceed the server VAD silence window by one frame so the provider
+        # timeline is guaranteed to cross it. 24kHz mono pcm16 → 48 bytes/ms.
+        tail_ms = self.config.server_vad_silence_duration_ms + 20
+        zeros = b"\x00" * (tail_ms * 48)
+        try:
+            await transport.append_audio(zeros)
+        except Exception:
+            self.telemetry.incr("silence_tail_errors")
+            return
+        self.telemetry.incr("silence_tails_appended")
+        self.telemetry.incr("silence_tail_bytes", len(zeros))
+        logger.info(
+            "discord_realtime silence_tail_appended guild=%s turn=%d ms=%d "
+            "bytes=%d", self.guild_id, self.turn_seq, tail_ms, len(zeros),
+        )
+
+    def _cancel_silence_tail(self) -> None:
+        task, self._silence_tail_task = self._silence_tail_task, None
+        if task is not None and not task.done():
+            task.cancel()
 
     def _buffer_for_demotion(self, user_id: int, pcm: bytes) -> None:
         limit = int(self.config.demotion_buffer_seconds * _DISCORD_BYTES_PER_SECOND)
@@ -503,6 +569,7 @@ class RealtimeVoiceLane:
 
     def _demote_to_cascaded(self) -> None:
         self.state = LaneState.CASCADED
+        self._cancel_silence_tail()
         self._clear_playback()
         receiver = self._receiver
         if receiver is not None and hasattr(receiver, "set_frame_sink"):

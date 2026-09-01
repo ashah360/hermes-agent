@@ -53,10 +53,12 @@ class RealtimeVoiceConfig:
     # never closes (live: counters froze, no speech_stopped for minutes).
     # After this much wall-clock input inactivity the lane appends an
     # explicit zero-PCM tail (> server_vad_silence_duration_ms) so the turn
-    # completes. 350ms default: comfortably above Discord's own silence-
-    # frame cutoff and inter-packet jitter, below natural between-sentence
-    # pauses' impact (the VAD window itself still governs turn end).
-    discord_input_idle_ms: int = 350
+    # completes. 800ms default: the first true Discord E2E showed 350ms
+    # split one natural ~9.9s request into three turns at ~500-700ms
+    # punctuation pauses — 800ms sits above ordinary sentence pauses while
+    # keeping total turn-close latency under the 1.5s product goal
+    # (idle 800ms + VAD window). Bounded 100..1500.
+    discord_input_idle_ms: int = 800
     # Worker performance knobs: SAME model/provider as the session (never a
     # quality downgrade) — speed comes from low reasoning effort, priority
     # service tier, and a bounded iteration budget. Scoped to realtime voice
@@ -171,7 +173,7 @@ def load_realtime_voice_config(raw: Optional[Mapping[str, Any]]) -> RealtimeVoic
             ),
         ),
         discord_input_idle_ms=min(
-            2000,
+            1500,
             _as_int(
                 raw.get("discord_input_idle_ms"),
                 defaults.discord_input_idle_ms, 100,

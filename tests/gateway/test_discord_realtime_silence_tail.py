@@ -174,12 +174,34 @@ class TestSilenceTail:
             assert _zero_tails(transport) == [], f"tail leaked for {vad}"
             await lane.stop()
 
-    def test_idle_ms_config_bounds(self):
+    def test_idle_ms_default_and_bounds(self):
+        # First true Discord E2E: 350ms split one natural ~9.9s request into
+        # three provider turns at ~500-700ms punctuation pauses. Default is
+        # 800ms — above ordinary sentence pauses, under the 1.5s product
+        # goal for turn-close latency.
         cfg = load_realtime_voice_config({})
-        assert 100 <= cfg.discord_input_idle_ms <= 2000
+        assert cfg.discord_input_idle_ms == 800
         assert load_realtime_voice_config(
             {"discord_input_idle_ms": 5}
         ).discord_input_idle_ms >= 100
         assert load_realtime_voice_config(
             {"discord_input_idle_ms": 60000}
-        ).discord_input_idle_ms <= 2000
+        ).discord_input_idle_ms <= 1500
+
+    @pytest.mark.asyncio
+    async def test_natural_sentence_pause_does_not_split_the_turn(self):
+        """Live regression (turns 2/3/4): a 500-700ms punctuation pause with
+        resumed speech must cancel the stale tail — one turn, no tail. A
+        true >=800ms cessation then emits exactly one tail."""
+        lane, transport = await _make_lane(discord_input_idle_ms=800)
+        await _feed(lane, n=5)
+        await asyncio.sleep(0.6)             # natural punctuation pause
+        assert _zero_tails(transport) == []  # tail NOT yet emitted
+        await _feed(lane, n=5)               # speaker resumes: stale tail dies
+        await asyncio.sleep(0.6)
+        assert _zero_tails(transport) == []  # still one open turn, no tail
+        await _feed(lane, n=2)
+        await asyncio.sleep(1.1)             # true cessation >= 800ms
+        assert len(_zero_tails(transport)) == 1
+        assert len(_speech_appends(transport)) == 12
+        await lane.stop()

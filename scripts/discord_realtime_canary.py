@@ -243,7 +243,8 @@ async def _text_turn(transport, probe, timeout: float) -> dict:
 
 
 async def _vad_audio_turn(transport, probe, timeout: float,
-                          silence_ms: int = 520, *, pace: bool = True) -> dict:
+                          silence_ms: int = 520, *, pace: bool = True,
+                          idle_wait_s: float = 0.85) -> dict:
     """Auto-VAD turn modeling REAL Discord behavior: finite speech packets,
     then packet cessation — no further input except the zero tail the lane's
     silence-tail machinery appends (Discord stops RTP after a speaker goes
@@ -259,9 +260,9 @@ async def _vad_audio_turn(transport, probe, timeout: float,
             await asyncio.sleep(0.1)
     speech_end = time.monotonic()
     # The lane's silence tail (discord_input_idle_ms then zeros exceeding
-    # server_vad_silence_duration_ms), modeled exactly.
+    # server_vad_silence_duration_ms), modeled from the CONFIG value.
     if pace:
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(idle_wait_s)
     await transport.append_audio(b"\x00" * (silence_ms * 48))
     ok = await _wait(probe.first_audio_event, timeout)
     first_ms = (probe.first_audio_at - speech_end) * 1000.0 if ok else None
@@ -371,9 +372,17 @@ async def run_canary(args) -> int:
         text_turns = [await _text_turn(transport, probe, args.timeout)
                       for _ in range(args.turns)]
         # Auto-VAD turns: finite speech packets then cessation + lane-style
-        # zero tail — the exact live Discord shape.
-        vad_turns = [await _vad_audio_turn(transport, probe, args.timeout)
-                     for _ in range(max(1, args.turns // 2))]
+        # zero tail — the exact live Discord shape. Idle wait and tail sizes
+        # come from the config, never hardcoded.
+        _idle_wait_s = config.discord_input_idle_ms / 1000.0 + 0.05
+        _tail_ms = config.server_vad_silence_duration_ms + 20
+        vad_turns = [
+            await _vad_audio_turn(
+                transport, probe, args.timeout,
+                silence_ms=_tail_ms, idle_wait_s=_idle_wait_s,
+            )
+            for _ in range(max(1, args.turns // 2))
+        ]
         interruption = await _interruption_turn(transport, probe, args.timeout)
     finally:
         seen_events |= transport.seen_event_types

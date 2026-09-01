@@ -98,6 +98,52 @@ class RealtimeVoiceLane:
         self._stopped = False
 
     # ------------------------------------------------------------------
+    # Transport-facing surface
+    # ------------------------------------------------------------------
+
+    def get_projection(self) -> str:
+        """Join-time projection, built once and frozen (byte-stable across
+        reconnects and rollover — ADR D5/D10)."""
+        cached = getattr(self, "_projection", None)
+        if cached is not None:
+            return cached
+        from .projection import build_projection
+
+        guild_name = voice_channel_name = text_channel_name = user_display_name = ""
+        vc = self._voice_client
+        try:
+            channel = getattr(vc, "channel", None)
+            if channel is not None:
+                voice_channel_name = str(getattr(channel, "name", "") or "")
+                guild = getattr(channel, "guild", None)
+                guild_name = str(getattr(guild, "name", "") or "")
+        except Exception:
+            pass
+        adapter = self._adapter
+        if adapter is not None and self.text_channel_id and getattr(adapter, "_client", None):
+            try:
+                ch = adapter._client.get_channel(int(self.text_channel_id))
+                text_channel_name = str(getattr(ch, "name", "") or "")
+            except Exception:
+                pass
+        self._projection = build_projection(
+            config=self.config,
+            guild_name=guild_name,
+            voice_channel_name=voice_channel_name,
+            text_channel_name=text_channel_name,
+            user_display_name=user_display_name,
+        )
+        return self._projection
+
+    def session_tool_schemas(self) -> list:
+        """In-lane tool schemas for the provider session (never core tools)."""
+        try:
+            from .tools import lane_tool_schemas
+        except ImportError:
+            return []
+        return lane_tool_schemas()
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 

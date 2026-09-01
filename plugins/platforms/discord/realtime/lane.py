@@ -243,6 +243,13 @@ class RealtimeVoiceLane:
             return
         if user_id:
             self.last_speaker_user_id = user_id
+        self.telemetry.incr("input_frames")
+        if not getattr(self, "_logged_first_input", False):
+            self._logged_first_input = True
+            logger.info(
+                "discord_realtime first_input_frame guild=%s user=%s ssrc=%s bytes=%d",
+                self.guild_id, user_id, ssrc, len(pcm),
+            )
         with self._frame_lock:
             self._frame_queue.append((user_id, ssrc, pcm))
         loop, event = self._loop, self._frame_event
@@ -274,8 +281,22 @@ class RealtimeVoiceLane:
 
             try:
                 await self.transport.append_audio(discord_pcm_to_realtime(pcm))
+                self.telemetry.incr("appended_frames")
+                if not getattr(self, "_logged_first_append", False):
+                    self._logged_first_append = True
+                    logger.info(
+                        "discord_realtime first_append_audio guild=%s user=%s "
+                        "ssrc=%s bytes_out=%d",
+                        self.guild_id, user_id, ssrc, len(pcm) // 4,
+                    )
             except Exception:
                 self.telemetry.incr("append_audio_errors")
+                if not getattr(self, "_warned_append_failure", False):
+                    self._warned_append_failure = True
+                    logger.warning(
+                        "discord_realtime first_append_failure guild=%s",
+                        self.guild_id, exc_info=True,
+                    )
         elif self.state is LaneState.DEMOTING:
             self._buffer_for_demotion(user_id, pcm)
 
@@ -317,11 +338,19 @@ class RealtimeVoiceLane:
                 pass
         self.telemetry.record_ms("barge_in_stop_ms", (self._clock() - started) * 1000.0)
         self.telemetry.incr("barge_ins")
+        logger.info(
+            "discord_realtime provider_speech_started guild=%s turn=%d",
+            self.guild_id, self.turn_seq,
+        )
 
     def on_user_speech_stopped(self) -> None:
         self._speech_stopped_at = self._clock()
         self._first_audio_recorded = False
         self._user_speaking = False
+        logger.info(
+            "discord_realtime provider_speech_stopped guild=%s turn=%d",
+            self.guild_id, self.turn_seq,
+        )
         self._try_flush_injections()
 
     def on_response_audio_delta(self, pcm_24k_mono: bytes) -> None:

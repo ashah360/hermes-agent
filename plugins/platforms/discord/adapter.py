@@ -618,6 +618,80 @@ class VoiceReceiver:
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
 
+        # ── Receive-path observability (privacy-safe: counts/bytes only) ──
+        # Seam counters: raw → RTP → NaCl → DAVE → Opus → sink/buffers.
+        self.counters: Dict[str, int] = defaultdict(int)
+        self._logged_firsts: set = set()
+        self._warned_failures: set = set()
+        self._last_stats_log = 0.0
+
+        # Hook lifecycle bookkeeping so stop() restores exactly what it
+        # wrapped (a dead receiver must never stay chained on a reused
+        # voice connection).
+        self._conn = None
+        self._installed_hook = None
+        self._prior_hook = None
+
+    # ------------------------------------------------------------------
+    # Observability helpers (SocketReader thread; bounded logging)
+    # ------------------------------------------------------------------
+
+    def _log_first(self, key: str, message: str, *args) -> None:
+        if key in self._logged_firsts:
+            return
+        self._logged_firsts.add(key)
+        logger.info("voice_rx " + message, *args)
+
+    def _count_failure(self, failure_class: str, detail: str) -> None:
+        """Count a failure and WARN on the FIRST of each class, always."""
+        self.counters[failure_class] += 1
+        if failure_class not in self._warned_failures:
+            self._warned_failures.add(failure_class)
+            logger.warning(
+                "voice_rx first_failure class=%s detail=%s", failure_class, detail
+            )
+
+    def _maybe_log_stats(self) -> None:
+        """Periodic aggregate (~5s) — only emitted while packets arrive."""
+        now = time.monotonic()
+        if now - self._last_stats_log < 5.0:
+            return
+        self._last_stats_log = now
+        logger.info(
+            "voice_rx stats raw=%d rtp=%d nacl_ok=%d nacl_fail=%d dave_ok=%d "
+            "dave_fail=%d dave_passthrough=%d opus_ok=%d opus_fail=%d "
+            "sink_calls=%d sink_bytes=%d buffered_frames=%d",
+            self.counters["raw_packets"], self.counters["rtp_accepted"],
+            self.counters["nacl_ok"], self.counters["nacl_fail"],
+            self.counters["dave_ok"], self.counters["dave_fail"],
+            self.counters["dave_passthrough"], self.counters["opus_ok"],
+            self.counters["opus_fail"], self.counters["sink_calls"],
+            self.counters["sink_bytes"], self.counters["buffered_frames"],
+        )
+
+    def _current_secret_key(self) -> Optional[bytes]:
+        """Read the transport key LIVE from the connection.
+
+        A voice-server reconnect rotates ``conn.secret_key``; decrypting
+        with the copy cached at start() makes every subsequent packet fail
+        NaCl silently (heard as: SPEAKING events but no audio).
+        """
+        conn = self._conn
+        try:
+            key = getattr(conn, "secret_key", None) if conn is not None else None
+            if key:
+                return bytes(key)
+        except Exception:
+            pass
+        return self._secret_key
+
+    def _current_dave_session(self):
+        """Read the DAVE session LIVE (rotates with the same reconnects)."""
+        conn = self._conn
+        if conn is not None and hasattr(conn, "dave_session"):
+            return conn.dave_session
+        return self._dave_session
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -625,6 +699,7 @@ class VoiceReceiver:
     def start(self):
         """Start listening for voice packets."""
         conn = self._vc._connection
+        self._conn = conn
         self._secret_key = bytes(conn.secret_key)
         self._dave_session = conn.dave_session
         self._bot_ssrc = conn.ssrc
@@ -635,12 +710,28 @@ class VoiceReceiver:
         logger.info("VoiceReceiver started (bot_ssrc=%d)", self._bot_ssrc)
 
     def stop(self):
-        """Stop listening and clean up."""
+        """Stop listening and clean up.
+
+        Restores the SPEAKING hook this receiver installed (only when it is
+        still the current one — never clobber a newer receiver's hook) and
+        removes only its own socket listener, so a fresh receiver on the
+        same connection stays fully active after a leave→rejoin.
+        """
         self._running = False
+        conn = self._conn if self._conn is not None else self._vc._connection
         try:
-            self._vc._connection.remove_socket_listener(self._on_packet)
+            conn.remove_socket_listener(self._on_packet)
         except Exception:
             pass
+        try:
+            if self._installed_hook is not None:
+                if getattr(conn, "hook", None) is self._installed_hook:
+                    conn.hook = self._prior_hook
+                ws = getattr(conn, "ws", None)
+                if ws is not None and getattr(ws, "_hook", None) is self._installed_hook:
+                    ws._hook = self._prior_hook
+        except Exception:
+            logger.debug("VoiceReceiver hook restore failed", exc_info=True)
         with self._lock:
             self._buffers.clear()
             self._last_packet_time.clear()
@@ -671,12 +762,21 @@ class VoiceReceiver:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
             try:
                 sink(user_id, ssrc, pcm)
+                self.counters["sink_calls"] += 1
+                self.counters["sink_bytes"] += len(pcm)
+                self._log_first(
+                    "first_sink_delivery",
+                    "first_sink_delivery ssrc=%d user=%d pcm_bytes=%d",
+                    ssrc, user_id, len(pcm),
+                )
             except Exception:
+                self._count_failure("sink_fail", "frame sink raised")
                 logger.debug("Voice frame sink failed", exc_info=True)
             return
         with self._lock:
             self._buffers[ssrc].extend(pcm)
             self._last_packet_time[ssrc] = time.monotonic()
+        self.counters["buffered_frames"] += 1
 
     # ------------------------------------------------------------------
     # SSRC -> user_id mapping via SPEAKING opcode hook
@@ -713,7 +813,10 @@ class VoiceReceiver:
             if original_hook:
                 await original_hook(ws, msg)
 
-        # Set on connection state (for future reconnects)
+        # Set on connection state (for future reconnects), remembering what
+        # we wrapped so stop() can restore it exactly.
+        self._installed_hook = wrapped_hook
+        self._prior_hook = original_hook
         conn.hook = wrapped_hook
         # Set on the current live websocket (for immediate effect)
         try:
@@ -729,8 +832,10 @@ class VoiceReceiver:
     # ------------------------------------------------------------------
 
     def _on_packet(self, data: bytes):
+        self.counters["raw_packets"] += 1
         if not self._running or self._paused:
             return
+        self._maybe_log_stats()
 
         # Log first few raw packets for debugging
         self._packet_debug_count += 1
@@ -750,6 +855,7 @@ class VoiceReceiver:
             if self._packet_debug_count <= 5:
                 logger.debug("Skipped non-RTP: byte0=0x%02x byte1=0x%02x", data[0], data[1])
             return
+        self.counters["rtp_accepted"] += 1
 
         first_byte = data[0]
         _, _, seq, timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
@@ -794,9 +900,15 @@ class VoiceReceiver:
 
         try:
             import nacl.secret  # noqa: E402 — delayed import, only in voice path
-            box = nacl.secret.Aead(self._secret_key)
+            # Live key read: rotated on voice-server reconnects (stale cached
+            # keys made every packet fail silently after a reconnect).
+            box = nacl.secret.Aead(self._current_secret_key())
             decrypted = box.decrypt(encrypted, header, bytes(nonce))
+            self.counters["nacl_ok"] += 1
         except Exception as e:
+            self._count_failure(
+                "nacl_fail", f"{e} (hdr={header_size}, enc={len(encrypted)})"
+            )
             if self._packet_debug_count <= 10:
                 logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
             return
@@ -831,21 +943,27 @@ class VoiceReceiver:
                 return
 
         # --- DAVE E2EE decrypt ---
-        if self._dave_session:
+        dave_session = self._current_dave_session()
+        if dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
             if user_id:
                 try:
                     import davey
-                    decrypted = self._dave_session.decrypt(
+                    decrypted = dave_session.decrypt(
                         user_id, davey.MediaType.audio, decrypted
                     )
+                    self.counters["dave_ok"] += 1
                 except Exception as e:
                     # Unencrypted passthrough — use NaCl-decrypted data as-is
                     if "Unencrypted" not in str(e):
+                        self._count_failure("dave_fail", f"ssrc={ssrc}: {e}")
                         if self._packet_debug_count <= 10:
                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
                         return
+                    self.counters["dave_passthrough"] += 1
+            else:
+                self.counters["dave_passthrough"] += 1
             # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
             # Opus decode directly — audio may be in passthrough mode.
             # Buffer will get a user_id when SPEAKING event arrives later.
@@ -855,8 +973,16 @@ class VoiceReceiver:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
+            self.counters["opus_ok"] += 1
+            self._log_first(
+                "decoded_frame",
+                "first_decoded_frame ssrc=%d pcm_bytes=%d raw=%d rtp=%d nacl_ok=%d",
+                ssrc, len(pcm), self.counters["raw_packets"],
+                self.counters["rtp_accepted"], self.counters["nacl_ok"],
+            )
             self._deliver_pcm(ssrc, pcm)
         except Exception as e:
+            self._count_failure("opus_fail", f"ssrc={ssrc}: {e}")
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug(

@@ -91,7 +91,8 @@ class RealtimeTransport:
         - ``output_modalities: ["audio"]`` (``modalities`` is beta-era);
         - audio config nested under ``audio.input`` / ``audio.output`` with
           ``{type: "audio/pcm", rate: 24000}`` formats;
-        - semantic VAD with conversation-mode interruption fields;
+        - server VAD (production default; semantic_vad opt-in) with explicit
+          tuning and lane-owned interruption (interrupt_response=False);
         - input transcription only at its GA nested location, and only when
           configured (the minimal live vertical omits it);
         - reasoning effort as the nested ``reasoning: {effort}`` object.
@@ -101,11 +102,24 @@ class RealtimeTransport:
             # says pass null to disable VAD entirely.
             turn_detection = None
         else:
+            # interrupt_response=False on BOTH VAD modes: the lane is the
+            # single cancel owner (local clear + generation-bound provider
+            # cancel). Provider auto-cancel racing our explicit cancel was
+            # the live response_cancel_not_active source.
             turn_detection = {
                 "type": self.config.turn_detection_type,
-                "interrupt_response": True,
+                "interrupt_response": False,
                 "create_response": True,
             }
+            if self.config.turn_detection_type == "server_vad":
+                # Server-only tuning fields — rejected on semantic_vad.
+                turn_detection["threshold"] = self.config.server_vad_threshold
+                turn_detection["prefix_padding_ms"] = (
+                    self.config.server_vad_prefix_padding_ms
+                )
+                turn_detection["silence_duration_ms"] = (
+                    self.config.server_vad_silence_duration_ms
+                )
         audio_input: dict = {
             "format": {"type": "audio/pcm", "rate": 24000},
             "turn_detection": turn_detection,

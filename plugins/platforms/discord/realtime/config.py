@@ -36,9 +36,17 @@ class RealtimeVoiceConfig:
     # Empty (default) omits the block entirely — the minimal live vertical
     # does not require input transcripts.
     input_transcription_model: str = ""
-    # audio.input.turn_detection type. Production default is semantic_vad;
-    # "none" disables VAD (JSON null) for manual-commit sessions (canary).
-    turn_detection_type: str = "semantic_vad"
+    # audio.input.turn_detection type. Production default is server_vad —
+    # live logs showed semantic_vad holding turns open 12-29s, while
+    # server_vad measured ~590ms speech-end->speech_stopped in the provider
+    # canary. semantic_vad remains opt-in; "none" disables VAD (JSON null)
+    # for manual-commit sessions (canary).
+    turn_detection_type: str = "server_vad"
+    # server_vad tuning (ignored for semantic_vad — server-only fields are
+    # rejected by the provider there).
+    server_vad_threshold: float = 0.5
+    server_vad_prefix_padding_ms: int = 300
+    server_vad_silence_duration_ms: int = 500
     # Worker performance knobs: SAME model/provider as the session (never a
     # quality downgrade) — speed comes from low reasoning effort, priority
     # service tier, and a bounded iteration budget. Scoped to realtime voice
@@ -134,6 +142,24 @@ def load_realtime_voice_config(raw: Optional[Mapping[str, Any]]) -> RealtimeVoic
         turn_detection_type=_as_str(
             raw.get("turn_detection_type"), defaults.turn_detection_type
         ).lower(),
+        server_vad_threshold=min(
+            1.0,
+            _as_float(raw.get("server_vad_threshold"), defaults.server_vad_threshold, 0.0),
+        ),
+        server_vad_prefix_padding_ms=min(
+            5000,
+            _as_int(
+                raw.get("server_vad_prefix_padding_ms"),
+                defaults.server_vad_prefix_padding_ms, 0,
+            ),
+        ),
+        server_vad_silence_duration_ms=min(
+            10000,
+            _as_int(
+                raw.get("server_vad_silence_duration_ms"),
+                defaults.server_vad_silence_duration_ms, 50,
+            ),
+        ),
         worker_reasoning_effort=_validated_effort(
             raw.get("worker_reasoning_effort"), defaults.worker_reasoning_effort
         ),

@@ -175,7 +175,11 @@ no client SDK, no WebRTC):
 - `wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1`, `Authorization:
   Bearer <secret>`.
 - `session.update` on connect: pcm16 in/out, server VAD with barge-in
-  (`turn_detection: {type: server_vad, interrupt_response: true}`),
+  (`turn_detection: {type: server_vad, threshold, prefix_padding_ms,
+  silence_duration_ms, interrupt_response: false, create_response: true}` —
+  the lane is the single cancel owner: local clear + generation-bound
+  provider cancel; provider auto-interrupt stays off to avoid the
+  `response_cancel_not_active` race),
   `reasoning_effort: low` (2.1 session field; if the deployed API build rejects
   it, degrade by omitting — log once, don't fail the lane), `voice: cedar`
   (verified per D1), tools (D6), instructions = projection (D5).

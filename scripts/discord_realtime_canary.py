@@ -245,7 +245,7 @@ async def _text_turn(transport, probe, timeout: float) -> dict:
 async def _manual_audio_turn(transport, probe, timeout: float, *, pace: bool = True) -> dict:
     """Real audio turn on a MANUAL-VAD session (turn_detection: null).
 
-    With semantic VAD + create_response the server auto-commits and
+    With server/semantic VAD + create_response the server auto-commits and
     auto-responds, so a manual commit/create there hits an already-consumed
     buffer (``input_audio_buffer_commit_empty`` — the first live run's
     defect). Manual commits are therefore exercised ONLY on this dedicated
@@ -307,7 +307,7 @@ async def run_canary(args) -> int:
     failures: list[str] = []
     seen_events: set[str] = set()
 
-    # ── Session 1: PRODUCTION shape (semantic VAD). Text turns +
+    # ── Session 1: PRODUCTION shape (server VAD default). Text turns +
     # interruption only — no manual commits here, ever: the server owns
     # commit/response on this session (first live run's commit_empty bug). ──
     config = load_realtime_voice_config({

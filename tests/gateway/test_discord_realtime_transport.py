@@ -60,7 +60,42 @@ class FakeRealtimeWS:
                     ),
                 },
             }
-        return None
+        td = ((session.get("audio") or {}).get("input") or {}).get("turn_detection")
+        return self._validate_turn_detection(td)
+
+    @staticmethod
+    def _validate_turn_detection(td):
+        """Real-shape rejection: server-only tuning fields are invalid on
+        semantic_vad, and unknown VAD types are refused."""
+        if td is None:
+            return None
+        ttype = td.get("type")
+        server_only = {"threshold", "prefix_padding_ms", "silence_duration_ms"}
+        if ttype == "semantic_vad":
+            bad = sorted(server_only & set(td))
+            if bad:
+                return {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "unknown_parameter",
+                        "message": (
+                            "Unknown parameter for semantic_vad: "
+                            + ", ".join(f"turn_detection.{b}" for b in bad)
+                        ),
+                    },
+                }
+            return None
+        if ttype == "server_vad":
+            return None
+        return {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_value",
+                "message": f"Invalid turn_detection.type: {ttype!r}",
+            },
+        }
 
     async def send(self, data):
         msg = json.loads(data)
@@ -193,9 +228,18 @@ class TestGASessionBootstrap:
         assert session["audio"]["input"]["format"] == {
             "type": "audio/pcm", "rate": 24000,
         }
+        # Production default is server_vad with explicit tuning: live logs
+        # showed semantic_vad holding turns open 12-29s; server_vad measured
+        # ~590ms speech-end->speech_stopped in the provider canary.
         td = session["audio"]["input"]["turn_detection"]
-        assert td["type"] == "semantic_vad"
-        assert td["interrupt_response"] is True
+        assert td["type"] == "server_vad"
+        assert td["threshold"] == 0.5
+        assert td["prefix_padding_ms"] == 300
+        assert td["silence_duration_ms"] == 500
+        # Single cancel owner: the LANE owns interruption (local clear +
+        # generation-bound provider cancel); provider auto-cancel is OFF or
+        # the two race into response_cancel_not_active (live evidence).
+        assert td["interrupt_response"] is False
         assert td["create_response"] is True
         assert session["audio"]["output"]["format"] == {
             "type": "audio/pcm", "rate": 24000,
@@ -244,6 +288,75 @@ class TestGASessionBootstrap:
         assert "reasoning" in updates[0]["session"]
         assert "reasoning" not in updates[1]["session"]
         await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_server_vad_tuning_knobs_and_bounds(self):
+        cfg = load_realtime_voice_config({
+            "enabled": True,
+            "server_vad_threshold": 0.8,
+            "server_vad_prefix_padding_ms": 100,
+            "server_vad_silence_duration_ms": 350,
+        })
+        transport, ws, lane, _ = _make_transport(FakeRealtimeWS(), config=cfg)
+        await transport.connect()
+        td = next(m for m in ws.sent if m["type"] == "session.update")["session"]["audio"]["input"]["turn_detection"]
+        assert td["threshold"] == 0.8
+        assert td["prefix_padding_ms"] == 100
+        assert td["silence_duration_ms"] == 350
+        await transport.close()
+
+        # Out-of-range values clamp to sane bounds, never pass through raw.
+        wild = load_realtime_voice_config({
+            "enabled": True,
+            "server_vad_threshold": 7.5,
+            "server_vad_prefix_padding_ms": -50,
+            "server_vad_silence_duration_ms": 10_000_000,
+        })
+        assert 0.0 <= wild.server_vad_threshold <= 1.0
+        assert wild.server_vad_prefix_padding_ms >= 0
+        assert wild.server_vad_silence_duration_ms <= 10000
+
+    @pytest.mark.asyncio
+    async def test_semantic_vad_opt_in_carries_no_server_only_fields(self):
+        cfg = load_realtime_voice_config({
+            "enabled": True, "turn_detection_type": "semantic_vad",
+        })
+        transport, ws, lane, _ = _make_transport(FakeRealtimeWS(), config=cfg)
+        await transport.connect()
+        td = next(m for m in ws.sent if m["type"] == "session.update")["session"]["audio"]["input"]["turn_detection"]
+        assert td["type"] == "semantic_vad"
+        for server_only in ("threshold", "prefix_padding_ms", "silence_duration_ms"):
+            assert server_only not in td
+        assert td["interrupt_response"] is False
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_manual_none_stays_null(self):
+        cfg = load_realtime_voice_config({
+            "enabled": True, "turn_detection_type": "none",
+        })
+        transport, ws, lane, _ = _make_transport(FakeRealtimeWS(), config=cfg)
+        await transport.connect()
+        td = next(m for m in ws.sent if m["type"] == "session.update")["session"]["audio"]["input"]["turn_detection"]
+        assert td is None
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_provider_rejects_server_fields_on_semantic_vad(self):
+        # Real-shape rejection mock: the GA API refuses server-only tuning
+        # fields on a semantic_vad turn_detection block.
+        ws = FakeRealtimeWS()
+        err = ws._validate_turn_detection({
+            "type": "semantic_vad", "threshold": 0.5,
+            "interrupt_response": False, "create_response": True,
+        })
+        assert err is not None
+        assert "threshold" in err["error"]["message"]
+        assert ws._validate_turn_detection({
+            "type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300,
+            "silence_duration_ms": 500, "interrupt_response": False,
+            "create_response": True,
+        }) is None
 
     @pytest.mark.asyncio
     async def test_input_transcription_omitted_by_default_nested_when_configured(self):

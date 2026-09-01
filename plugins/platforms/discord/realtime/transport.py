@@ -33,7 +33,11 @@ class VoiceMismatchError(RuntimeError):
 
 
 async def _default_ws_connect(url: str, headers: list) -> Any:
-    """Open a real provider socket (lazy websockets import)."""
+    """Open a real provider socket (lazy websockets import).
+
+    GA interface: NO ``OpenAI-Beta`` header — the live API refuses the beta
+    shape with ``invalid_request_error.beta_api_shape_disabled`` (WS 4000).
+    """
     try:
         from websockets.asyncio.client import connect as _connect
     except ImportError:  # pragma: no cover - legacy websockets
@@ -64,34 +68,75 @@ class RealtimeTransport:
         self._send_lock = asyncio.Lock()
         self._closed = False
         self._reasoning_degraded = False
+        # Accepted session.updated echo from bootstrap. Bootstrap consumes
+        # that frame itself (it never reaches _dispatch_event), so it is
+        # stored here for callers that need it (canary echo assertions).
+        self.session_echo: dict = {}
 
     # ------------------------------------------------------------------
     # Connect / bootstrap
     # ------------------------------------------------------------------
 
     def _session_payload(self, *, include_reasoning: bool) -> dict:
-        session: dict = {
-            "voice": self.config.voice,
-            "instructions": self._lane.get_projection(),
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            "turn_detection": {
-                "type": "server_vad",
+        """GA ``session.update`` payload (developers.openai.com, GA schema).
+
+        - ``type: "realtime"`` + ``model`` inside the session (required);
+        - ``output_modalities: ["audio"]`` (``modalities`` is beta-era);
+        - audio config nested under ``audio.input`` / ``audio.output`` with
+          ``{type: "audio/pcm", rate: 24000}`` formats;
+        - semantic VAD with conversation-mode interruption fields;
+        - input transcription only at its GA nested location, and only when
+          configured (the minimal live vertical omits it);
+        - reasoning effort as the nested ``reasoning: {effort}`` object.
+        """
+        if self.config.turn_detection_type in ("none", "null", "off"):
+            # Manual turn taking (canary's manual-commit session): GA spec
+            # says pass null to disable VAD entirely.
+            turn_detection = None
+        else:
+            turn_detection = {
+                "type": self.config.turn_detection_type,
                 "interrupt_response": True,
+                "create_response": True,
+            }
+        audio_input: dict = {
+            "format": {"type": "audio/pcm", "rate": 24000},
+            "turn_detection": turn_detection,
+        }
+        if self.config.input_transcription_model:
+            audio_input["transcription"] = {
+                "model": self.config.input_transcription_model
+            }
+        session: dict = {
+            "type": "realtime",
+            "model": self.config.model,
+            "output_modalities": ["audio"],
+            "instructions": self._lane.get_projection(),
+            "audio": {
+                "input": audio_input,
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                    "voice": self.config.voice,
+                },
             },
-            "input_audio_transcription": {"model": "whisper-1"},
             "tools": list(self._lane.session_tool_schemas()),
             "tool_choice": "auto",
         }
         if include_reasoning and self.config.reasoning_effort:
-            session["reasoning_effort"] = self.config.reasoning_effort
+            session["reasoning"] = {"effort": self.config.reasoning_effort}
         return {"type": "session.update", "session": session}
+
+    @staticmethod
+    def _echo_voice(session: dict) -> Optional[str]:
+        """Voice from a session echo — GA nested location, root fallback."""
+        audio = session.get("audio") or {}
+        output = audio.get("output") or {}
+        return output.get("voice") or session.get("voice")
 
     async def connect(self) -> None:
         url = f"{REALTIME_URL}?model={self.config.model}"
         headers = [
             ("Authorization", f"Bearer {self._api_key}"),
-            ("OpenAI-Beta", "realtime=v1"),
         ]
         self._ws = await self._ws_connect(url, headers)
         try:
@@ -109,10 +154,12 @@ class RealtimeTransport:
                 raise ConnectionError("provider closed during session bootstrap")
             ftype = frame.get("type")
             if ftype in ("session.updated", "session.created"):
-                echo_voice = (frame.get("session") or {}).get("voice")
                 if ftype == "session.created":
                     # Initial hello; the updated echo follows our update.
                     continue
+                session_echo = dict(frame.get("session") or {})
+                self.session_echo = session_echo
+                echo_voice = self._echo_voice(session_echo)
                 if echo_voice and echo_voice != self.config.voice:
                     raise VoiceMismatchError(
                         f"provider voice echo is {echo_voice!r}, required "
@@ -126,13 +173,13 @@ class RealtimeTransport:
                 param = str(err.get("param", ""))
                 if (
                     not self._reasoning_degraded
-                    and "reasoning_effort" in (message + param)
+                    and "reasoning" in (message + param)
                 ):
-                    # Deployed API build predates the field: degrade by
-                    # omission (ADR D4), log once, keep the lane alive.
+                    # Provider rejected the reasoning field specifically:
+                    # degrade by omission (ADR D4), log once, keep the lane.
                     self._reasoning_degraded = True
                     logger.warning(
-                        "Realtime API rejected reasoning_effort; continuing without it"
+                        "Realtime API rejected session.reasoning; continuing without it"
                     )
                     await self._send_json(self._session_payload(include_reasoning=False))
                     continue
@@ -202,7 +249,11 @@ class RealtimeTransport:
                     frame.get("name") or "", args, frame.get("call_id") or ""
                 )
             elif ftype == "error":
-                logger.warning("Realtime API error event: %s", frame.get("error"))
+                error = frame.get("error") or {}
+                logger.warning("Realtime API error event: %s", error)
+                on_error = getattr(lane, "on_provider_error", None)
+                if callable(on_error):
+                    on_error(error)
             # All other event types are intentionally ignored.
         except Exception:
             logger.debug("lane event handler failed for %s", ftype, exc_info=True)
@@ -218,6 +269,10 @@ class RealtimeTransport:
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(pcm16_24k_mono).decode("ascii"),
         })
+
+    async def commit_audio(self) -> None:
+        """Force a turn boundary for the appended audio (canary/manual VAD)."""
+        await self._send_json({"type": "input_audio_buffer.commit"})
 
     def cancel_response_nowait(self) -> None:
         """Fire-and-forget response.cancel (barge-in hot path)."""

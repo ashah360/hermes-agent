@@ -229,6 +229,8 @@ class RealtimeVoiceLane:
         """Thread-safe frame intake; consumed by the asyncio pump."""
         if self._stopped:
             return
+        if user_id:
+            self.last_speaker_user_id = user_id
         with self._frame_lock:
             self._frame_queue.append((user_id, ssrc, pcm))
         loop, event = self._loop, self._frame_event
@@ -358,8 +360,49 @@ class RealtimeVoiceLane:
         self._schedule(_reply())
 
     def on_transport_closed(self, exc: Optional[BaseException]) -> None:
-        """Provider socket dropped outside our control (reconnect: ADR D2)."""
+        """Provider socket dropped outside our control.
+
+        Checkpoint behavior (no reconnect machinery yet): demote cleanly and
+        hand audio ownership back to the cascaded lane exactly once — the
+        frame sink is removed so the silence-detection path owns utterances
+        again. A user rejoin (or /voice join) re-attempts REALTIME.
+        """
         self.telemetry.incr("transport_drops")
+        if self._stopped:
+            return
+        logger.warning(
+            "Realtime voice transport dropped (guild=%d): %s — demoting to "
+            "cascaded voice", self.guild_id, exc,
+        )
+        self._demote_to_cascaded()
+
+    def _demote_to_cascaded(self) -> None:
+        self.state = LaneState.CASCADED
+        self._clear_playback()
+        receiver = self._receiver
+        if receiver is not None and hasattr(receiver, "set_frame_sink"):
+            try:
+                receiver.set_frame_sink(None)
+            except Exception:
+                pass
+        adapter = self._adapter
+        if adapter is not None:
+            try:
+                getattr(adapter, "_realtime_lanes", {}).pop(self.guild_id, None)
+            except Exception:
+                pass
+        transport, self.transport = self.transport, None
+        if transport is not None:
+            self._schedule(self._close_transport(transport))
+        self.telemetry.incr("demotions")
+        self.telemetry.maybe_flush(force=True)
+
+    @staticmethod
+    async def _close_transport(transport: Any) -> None:
+        try:
+            await transport.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Worker events: claim → queue → inject at a safe boundary (ADR D7/D8)

@@ -32,6 +32,13 @@ class RealtimeVoiceConfig:
     max_inflight_dispatches: int = 3
     transcript_window_turns: int = 40
     demotion_buffer_seconds: float = 10.0
+    # GA nested input transcription (audio.input.transcription.model).
+    # Empty (default) omits the block entirely — the minimal live vertical
+    # does not require input transcripts.
+    input_transcription_model: str = ""
+    # audio.input.turn_detection type. Production default is semantic_vad;
+    # "none" disables VAD (JSON null) for manual-commit sessions (canary).
+    turn_detection_type: str = "semantic_vad"
     # Exact sourced-synthesis TTS path (ADR D13).
     synthesis_tts_model: str = "gpt-4o-mini-tts"
     synthesis_voice: str = "cedar"
@@ -104,6 +111,14 @@ def load_realtime_voice_config(raw: Optional[Mapping[str, Any]]) -> RealtimeVoic
         demotion_buffer_seconds=_as_float(
             raw.get("demotion_buffer_seconds"), defaults.demotion_buffer_seconds, 1.0
         ),
+        input_transcription_model=(
+            raw.get("input_transcription_model").strip()
+            if isinstance(raw.get("input_transcription_model"), str)
+            else defaults.input_transcription_model
+        ),
+        turn_detection_type=_as_str(
+            raw.get("turn_detection_type"), defaults.turn_detection_type
+        ).lower(),
         synthesis_tts_model=_as_str(
             synthesis.get("tts_model"), defaults.synthesis_tts_model
         ),

@@ -1,8 +1,23 @@
-"""Realtime WS transport contracts (ADR D4): session bootstrap payload,
-cedar voice-echo verification, reasoning_effort degradation, event-name
-mapping (GA + legacy), audio append, and cancel.
+"""Realtime WS transport contracts against the CURRENT GA API shape.
 
-Uses an injected fake WebSocket — no network.
+The live provider rejected the beta payload with
+``invalid_request_error.beta_api_shape_disabled`` (WS close 4000) — mocks had
+hidden the contract gap. The fake socket here is therefore GA-STRICT: any
+beta-era key (root ``voice``/``turn_detection``/``input_audio_format``/
+``modalities``/``reasoning_effort``, or a missing ``session.type``) is
+rejected exactly like the live API, so a beta-shaped transport can never go
+green again.
+
+GA source of truth (developers.openai.com, Realtime guides + API reference):
+- no ``OpenAI-Beta`` header;
+- ``session.type: "realtime"``, ``model`` inside the session;
+- ``output_modalities: ["audio"]``;
+- ``audio.input.format = {type: audio/pcm, rate: 24000}``,
+  ``audio.input.turn_detection = {type: semantic_vad, ...}``;
+- ``audio.output.format = {type: audio/pcm, rate: 24000}``,
+  ``audio.output.voice = cedar``;
+- reasoning effort as ``reasoning: {effort}`` (object, not a root scalar);
+- GA response events (``response.output_audio.delta`` etc.).
 """
 
 import asyncio
@@ -13,9 +28,15 @@ import pytest
 
 from plugins.platforms.discord.realtime.config import load_realtime_voice_config
 
+# Beta-era session keys the GA API refuses (the live failure class).
+_BETA_SESSION_KEYS = {
+    "voice", "turn_detection", "input_audio_format", "output_audio_format",
+    "input_audio_transcription", "modalities", "reasoning_effort",
+}
+
 
 class FakeRealtimeWS:
-    """Scripted provider socket: echoes session.updated on session.update."""
+    """GA-strict scripted provider socket."""
 
     def __init__(self, *, voice_echo="cedar", reject_reasoning=False):
         self.sent = []
@@ -25,29 +46,59 @@ class FakeRealtimeWS:
         self._reject_reasoning = reject_reasoning
         self._rejected_once = False
 
+    def _validate_ga_session(self, session: dict):
+        beta_present = sorted(_BETA_SESSION_KEYS & set(session))
+        if beta_present or session.get("type") != "realtime":
+            return {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "beta_api_shape_disabled",
+                    "message": (
+                        "The beta Realtime API shape is disabled; migrate to "
+                        f"the GA session schema (offending: {beta_present or 'missing type'})."
+                    ),
+                },
+            }
+        return None
+
     async def send(self, data):
         msg = json.loads(data)
         self.sent.append(msg)
         if msg.get("type") == "session.update":
             session = msg.get("session") or {}
+            err = self._validate_ga_session(session)
+            if err is not None:
+                await self.inbox.put(json.dumps(err))
+                return
             if (
                 self._reject_reasoning
                 and not self._rejected_once
-                and "reasoning_effort" in session
+                and "reasoning" in session
             ):
                 self._rejected_once = True
                 await self.inbox.put(json.dumps({
                     "type": "error",
                     "error": {
                         "type": "invalid_request_error",
-                        "message": "Unknown parameter: 'session.reasoning_effort'.",
-                        "param": "session.reasoning_effort",
+                        "message": "Unknown parameter: 'session.reasoning'.",
+                        "param": "session.reasoning",
                     },
                 }))
                 return
             await self.inbox.put(json.dumps({
                 "type": "session.updated",
-                "session": {"voice": self._voice_echo, "model": "gpt-realtime-2.1"},
+                "session": {
+                    "type": "realtime",
+                    "model": "gpt-realtime-2.1",
+                    "output_modalities": ["audio"],
+                    "audio": {
+                        "output": {
+                            "voice": self._voice_echo,
+                            "format": {"type": "audio/pcm", "rate": 24000},
+                        }
+                    },
+                },
             }))
 
     async def recv(self):
@@ -123,27 +174,57 @@ def _make_transport(ws=None, *, config=None, lane=None):
     return transport, ws, lane, _ws_connect
 
 
-class TestSessionBootstrap:
+class TestGASessionBootstrap:
     @pytest.mark.asyncio
-    async def test_session_update_payload_and_url(self):
+    async def test_exact_ga_session_payload_and_headers(self):
         transport, ws, lane, connect = _make_transport()
         await transport.connect()
         assert "model=gpt-realtime-2.1" in connect.url
-        auth = dict(connect.headers).get("Authorization")
-        assert auth == "Bearer sk-test"
+        headers = dict(connect.headers)
+        assert headers.get("Authorization") == "Bearer sk-test"
+        # GA interface: the beta header must be GONE.
+        assert "OpenAI-Beta" not in headers
 
         update = next(m for m in ws.sent if m["type"] == "session.update")
         session = update["session"]
-        assert session["voice"] == "cedar"
-        assert session["reasoning_effort"] == "low"
-        assert session["instructions"] == "PROJECTION-BYTES-STABLE"
-        assert session["input_audio_format"] == "pcm16"
-        assert session["output_audio_format"] == "pcm16"
-        td = session["turn_detection"]
-        assert td["type"] == "server_vad"
+        assert session["type"] == "realtime"
+        assert session["model"] == "gpt-realtime-2.1"
+        assert session["output_modalities"] == ["audio"]
+        assert session["audio"]["input"]["format"] == {
+            "type": "audio/pcm", "rate": 24000,
+        }
+        td = session["audio"]["input"]["turn_detection"]
+        assert td["type"] == "semantic_vad"
         assert td["interrupt_response"] is True
+        assert td["create_response"] is True
+        assert session["audio"]["output"]["format"] == {
+            "type": "audio/pcm", "rate": 24000,
+        }
+        assert session["audio"]["output"]["voice"] == "cedar"
+        # Reasoning effort is the GA nested object, never a root scalar.
+        assert session["reasoning"] == {"effort": "low"}
+        assert session["instructions"] == "PROJECTION-BYTES-STABLE"
         assert session["tools"] == [{"type": "function", "name": "hermes_dispatch"}]
+        # No beta-era keys anywhere in the session payload.
+        assert not (_BETA_SESSION_KEYS & set(session))
         await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_beta_shape_is_rejected_by_ga_provider(self):
+        # Pin the failure class the live canary hit: the GA-strict fake must
+        # refuse a beta-shaped session with beta_api_shape_disabled.
+        ws = FakeRealtimeWS()
+        beta_session = {
+            "voice": "cedar",
+            "instructions": "x",
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "turn_detection": {"type": "server_vad", "interrupt_response": True},
+            "reasoning_effort": "low",
+        }
+        err = ws._validate_ga_session(beta_session)
+        assert err is not None
+        assert err["error"]["code"] == "beta_api_shape_disabled"
 
     @pytest.mark.asyncio
     async def test_voice_echo_mismatch_fails_connect(self):
@@ -154,15 +235,39 @@ class TestSessionBootstrap:
         assert ws.closed is True
 
     @pytest.mark.asyncio
-    async def test_reasoning_effort_rejection_degrades_by_omission(self):
+    async def test_reasoning_rejection_degrades_by_omission(self):
         ws = FakeRealtimeWS(reject_reasoning=True)
         transport, ws, lane, _ = _make_transport(ws)
         await transport.connect()
         updates = [m for m in ws.sent if m["type"] == "session.update"]
         assert len(updates) == 2
-        assert "reasoning_effort" in updates[0]["session"]
-        assert "reasoning_effort" not in updates[1]["session"]
+        assert "reasoning" in updates[0]["session"]
+        assert "reasoning" not in updates[1]["session"]
         await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_input_transcription_omitted_by_default_nested_when_configured(self):
+        # Default: no transcription block at all (beta top-level key is gone
+        # and the minimal live vertical does not need it).
+        transport, ws, lane, _ = _make_transport()
+        await transport.connect()
+        session = next(m for m in ws.sent if m["type"] == "session.update")["session"]
+        assert "input_audio_transcription" not in session
+        assert "transcription" not in session["audio"]["input"]
+        await transport.close()
+
+        # Configured: GA nested location audio.input.transcription.
+        cfg = load_realtime_voice_config(
+            {"enabled": True, "input_transcription_model": "gpt-live-transcribe"}
+        )
+        ws2 = FakeRealtimeWS()
+        transport2, ws2, _, _ = _make_transport(ws2, config=cfg)
+        await transport2.connect()
+        session2 = next(m for m in ws2.sent if m["type"] == "session.update")["session"]
+        assert session2["audio"]["input"]["transcription"] == {
+            "model": "gpt-live-transcribe"
+        }
+        await transport2.close()
 
     @pytest.mark.asyncio
     async def test_instructions_byte_stable_across_connects(self):
@@ -180,7 +285,7 @@ class TestSessionBootstrap:
 
 class TestEventMapping:
     @pytest.mark.asyncio
-    async def test_ga_and_legacy_event_names_map_to_lane(self):
+    async def test_ga_event_names_map_to_lane(self):
         transport, ws, lane, _ = _make_transport()
         await transport.connect()
 
@@ -190,7 +295,7 @@ class TestEventMapping:
             {"type": "input_audio_buffer.speech_started"},
             {"type": "input_audio_buffer.speech_stopped"},
             {"type": "response.created", "response": {"id": "resp_1"}},
-            # GA name and legacy name must both deliver audio.
+            # GA name and legacy name must both deliver audio (tolerance).
             {"type": "response.output_audio.delta", "delta": b64},
             {"type": "response.audio.delta", "delta": b64},
             {"type": "response.output_audio_transcript.delta", "delta": "38 mill", "response_id": "resp_1"},
@@ -236,6 +341,15 @@ class TestOutbound:
         await transport.close()
         append = next(m for m in ws.sent if m["type"] == "input_audio_buffer.append")
         assert base64.b64decode(append["audio"]) == b"\x0a\x0b"
+
+    @pytest.mark.asyncio
+    async def test_commit_audio_sends_commit(self):
+        # Used by the provider canary to force a turn boundary without VAD.
+        transport, ws, lane, _ = _make_transport()
+        await transport.connect()
+        await transport.commit_audio()
+        await transport.close()
+        assert any(m["type"] == "input_audio_buffer.commit" for m in ws.sent)
 
     @pytest.mark.asyncio
     async def test_cancel_response_nowait_sends_cancel(self):

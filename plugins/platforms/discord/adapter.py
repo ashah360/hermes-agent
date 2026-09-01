@@ -4753,7 +4753,13 @@ class DiscordAdapter(BasePlatformAdapter):
             # Phase 3: install the continuous mixer (ambient bed + ducked
             # speech).  Best-effort — if it fails we fall back to the legacy
             # one-shot FFmpegPCMAudio playback path in play_in_voice_channel.
-            if getattr(self, "_voice_fx_cfg", {}).get("enabled"):
+            # The realtime lane streams its output THROUGH the mixer
+            # (StreamingMixerChild), so an enabled realtime flag requires the
+            # mixer even when voice_fx is off.
+            if (
+                getattr(self, "_voice_fx_cfg", {}).get("enabled")
+                or self._realtime_voice_enabled()
+            ):
                 try:
                     await self._install_voice_mixer(guild_id, vc)
                 except Exception as e:

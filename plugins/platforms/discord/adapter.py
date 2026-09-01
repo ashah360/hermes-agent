@@ -947,6 +947,11 @@ class VoiceReceiver:
         if dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
+            if not user_id:
+                # Discord can omit SPEAKING after the bot rejoins. DAVE needs
+                # the user ID before Opus decode, so the existing sole-member
+                # fallback must run here rather than only after buffering.
+                user_id = self._infer_user_for_ssrc(ssrc)
             if user_id:
                 try:
                     import davey
@@ -964,9 +969,8 @@ class VoiceReceiver:
                     self.counters["dave_passthrough"] += 1
             else:
                 self.counters["dave_passthrough"] += 1
-            # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
-            # Opus decode directly — audio may be in passthrough mode.
-            # Buffer will get a user_id when SPEAKING event arrives later.
+            # If SSRC is still unknown (ambiguous channel membership), skip
+            # DAVE and try Opus directly for passthrough-mode audio.
 
         # --- Opus decode -> PCM ---
         try:

@@ -223,6 +223,34 @@ class TestRealNaClWithDAVE:
         assert 100 in receiver._buffers
         assert len(receiver._buffers[100]) > 0
 
+    def test_dave_audio_without_speaking_event_reaches_realtime_sink(self):
+        """A sole allowed member is inferred before DAVE decrypt on rejoin."""
+        key = _make_secret_key()
+        dave = MagicMock()
+        dave.decrypt.return_value = b"\xf8\xff\xfe"  # valid Opus silence
+        member = SimpleNamespace(id=42)
+        receiver = _make_voice_receiver(
+            key,
+            dave_session=dave,
+            allowed_user_ids={"42"},
+            members=[member],
+        )
+        sink = MagicMock()
+        receiver.set_frame_sink(sink)
+
+        # Discord can omit OP 5 SPEAKING for a member already present when the
+        # bot rejoins. The NaCl payload is therefore still DAVE-encrypted and
+        # cannot be decoded until the sole member is inferred.
+        packet = _build_encrypted_rtp_packet(
+            key, b"still-dave-encrypted", ssrc=100
+        )
+        receiver._on_packet(packet)
+
+        dave.decrypt.assert_called_once_with(42, pytest.importorskip("davey").MediaType.audio, b"still-dave-encrypted")
+        sink.assert_called_once()
+        assert sink.call_args.args[:2] == (42, 100)
+        assert sink.call_args.args[2]
+
     def test_dave_unencrypted_error_passthrough(self):
         """DAVE raises 'Unencrypted' → use NaCl-decrypted data as-is."""
         key = _make_secret_key()

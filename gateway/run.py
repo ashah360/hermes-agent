@@ -24432,6 +24432,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
 
+    def build_realtime_worker_principal(
+        self,
+        *,
+        chat_id: str,
+        user_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ):
+        """Narrow factory: a principal SPEC for Discord realtime-voice workers.
+
+        Reuses the gateway's OWN resolution chain — the same
+        ``_resolve_session_agent_runtime`` + ``_resolve_enabled_toolsets_for_source``
+        pair every gateway agent construction goes through — so a worker child
+        (built via ``tools/delegate_tool._build_child_agent``) carries the same
+        model/provider/credentials/toolsets/profile as the bound session.
+
+        Returns a lightweight attribute SPEC (never a live, concurrently
+        running session agent: children must not share a running loop), or
+        ``None`` — fail closed — when no provider credentials resolve.
+        """
+        from types import SimpleNamespace
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id=str(chat_id or ""),
+            user_id=str(user_id or ""),
+            user_name=str(user_name or ""),
+            chat_type="channel",
+        )
+        user_config = _load_gateway_config()
+        model, runtime_kwargs = self._resolve_session_agent_runtime(
+            source=source, user_config=user_config
+        )
+        if not (runtime_kwargs.get("api_key") or "").strip():
+            logger.warning(
+                "realtime worker principal unavailable: no provider credentials"
+            )
+            return None
+        try:
+            enabled_toolsets = self._resolve_enabled_toolsets_for_source(
+                user_config or {}, source, _platform_config_key(Platform.DISCORD)
+            )
+        except Exception:
+            enabled_toolsets = None
+        disabled_toolsets = None
+        try:
+            from agent.skill_utils import parse_config_string_list
+
+            disabled_toolsets = parse_config_string_list(
+                ((user_config or {}).get("agent") or {}).get("disabled_toolsets")
+            ) or None
+        except Exception:
+            pass
+        return SimpleNamespace(
+            base_url=runtime_kwargs.get("base_url"),
+            api_key=runtime_kwargs.get("api_key"),
+            model=model,
+            provider=runtime_kwargs.get("provider"),
+            api_mode=runtime_kwargs.get("api_mode"),
+            request_overrides=dict(runtime_kwargs.get("request_overrides") or {}),
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            session_id=None,
+            prefill_messages=None,
+            user_id=str(user_id or ""),
+            user_name=str(user_name or ""),
+        )
+
     def _resolve_enabled_toolsets_for_source(
         self,
         user_config: dict,

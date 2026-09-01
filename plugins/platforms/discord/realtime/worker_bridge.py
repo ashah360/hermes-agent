@@ -253,6 +253,11 @@ class WorkerBridge:
             text_channel_id=self.lane.text_channel_id,
         )
         hooks = WorkerHooks(self, record)
+        logger.info(
+            "discord_realtime dispatch guild=%s dispatch=%s user=%s goal_len=%d live=%d",
+            self.lane.guild_id, record.dispatch_id, user_id, len(task),
+            registry.live_count(),
+        )
         self._emit(record, "started", spoken_ack_hint or f"Working on: {task}")
         future = self._executor.submit(self._run_worker, spec, hooks, record)
         with self._lock:
@@ -263,6 +268,10 @@ class WorkerBridge:
     def cancel(self, dispatch_id: str, *, reason: str) -> bool:
         """Explicit semantic cancellation: revoke + interrupt the child."""
         ok = self.lane.registry.revoke(dispatch_id, reason=reason)
+        logger.info(
+            "discord_realtime dispatch_cancel guild=%s dispatch=%s ok=%s",
+            self.lane.guild_id, dispatch_id, ok,
+        )
         if ok:
             self.lane.telemetry.incr("dispatch_cancelled")
         return ok
@@ -306,6 +315,10 @@ class WorkerBridge:
         if status not in ("completed", "failed", "cancelled"):
             status = "completed" if not result.get("error") else "failed"
         self.lane.registry.mark_terminal(spec.dispatch_id, status)
+        logger.info(
+            "discord_realtime dispatch_terminal guild=%s dispatch=%s status=%s",
+            self.lane.guild_id, spec.dispatch_id, status,
+        )
 
         final_response = str(result.get("final_response") or "")
         detail_ref = None

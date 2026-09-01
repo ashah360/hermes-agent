@@ -99,9 +99,17 @@ class RealtimeVoiceLane:
         self.delivered_events: list = []       # claim-passed events, in order
         self._pending_injections: Deque[Any] = collections.deque()
         self._user_speaking = False
-        self._response_active = False
         self._result_payloads: dict = {}       # dispatch_id -> result payload
         self.last_speaker_user_id = 0
+
+        # ── Response coordinator: at most ONE provider response in flight.
+        # Ownership is marked SYNCHRONOUSLY before scheduling response.create
+        # (waiting for the async response.created echo is the race that
+        # produced overlapping replies live). ──
+        self._response_owner: Optional[str] = None
+        self._provider_response_active = False
+        self._cancel_sent = False
+        self._pending_continuation = False
 
         # ── Exact transcript window (rollover restore, ADR D10) ──
         self._transcript: Deque[Tuple[str, str]] = collections.deque(
@@ -209,6 +217,10 @@ class RealtimeVoiceLane:
             self._pump_task.cancel()
             self._pump_task = None
         self._clear_playback()
+        self._response_owner = None
+        self._provider_response_active = False
+        self._pending_continuation = False
+        self._pending_injections.clear()
         # Voice delivery is revoked for every dispatch; outbox text delivery
         # stays live (registry keeps records for exactly-once text posting).
         self.registry.revoke_all(reason=reason)
@@ -282,16 +294,25 @@ class RealtimeVoiceLane:
     def on_user_speech_started(self) -> None:
         """Server-VAD speech start: immediate barge-in on the audio plane.
 
-        Bumps ``turn_seq`` and silences playback — it NEVER touches dispatch
-        ownership (ADR D8): follow-up speech must not stale a live worker.
+        Bumps ``turn_seq`` and ALWAYS silences playback — it NEVER touches
+        dispatch ownership (ADR D8). ``response.cancel`` is sent only when a
+        response is actually in flight, and exactly once per response (the
+        unconditional cancel produced ``response_cancel_not_active`` spam
+        live).
         """
         started = self._clock()
         self.turn_seq += 1
         self._user_speaking = True
         self._clear_playback()
-        if self.transport is not None:
+        response_live = self._response_owner is not None or self._provider_response_active
+        if response_live and not self._cancel_sent and self.transport is not None:
             try:
                 self.transport.cancel_response_nowait()
+                self._cancel_sent = True
+                logger.info(
+                    "discord_realtime cancel guild=%s owner=%s turn=%d",
+                    self.guild_id, self._response_owner, self.turn_seq,
+                )
             except Exception:
                 pass
         self.telemetry.record_ms("barge_in_stop_ms", (self._clock() - started) * 1000.0)
@@ -320,18 +341,63 @@ class RealtimeVoiceLane:
         self.telemetry.gauge("audio_out_queue_depth_ms", child.pending_ms())
 
     def on_response_created(self, response_id: Optional[str]) -> None:
-        self._response_active = True
+        self._provider_response_active = True
+        # A VAD-auto response we didn't schedule still occupies the single
+        # in-flight slot.
+        if self._response_owner is None:
+            self._response_owner = "native"
+        logger.info(
+            "discord_realtime response_created guild=%s owner=%s rid=%s queue=%d",
+            self.guild_id, self._response_owner, response_id,
+            len(self._pending_injections),
+        )
 
     def on_response_done(self) -> None:
         child = self._stream_child
         if child is not None:
             child.end()
             self._stream_child = None
-        self._response_active = False
         if self._output_transcript_parts:
             self.note_transcript("assistant", "".join(self._output_transcript_parts))
             self._output_transcript_parts = []
+        # Release the single in-flight slot, then advance exactly one step:
+        # a pending function-call continuation outranks queued worker events.
+        prior_owner = self._response_owner
+        self._provider_response_active = False
+        self._response_owner = None
+        self._cancel_sent = False
+        logger.info(
+            "discord_realtime response_done guild=%s owner=%s queue=%d continuation=%s",
+            self.guild_id, prior_owner, len(self._pending_injections),
+            self._pending_continuation,
+        )
+        if self._pending_continuation:
+            self._pending_continuation = False
+            self._own_and_create("continuation")
+            return
         self._try_flush_injections()
+
+    def _own_and_create(self, owner: str, *, instructions: Optional[str] = None) -> None:
+        """Synchronously take the in-flight slot, then schedule the create."""
+        self._response_owner = owner
+        transport = self.transport
+        if transport is None:
+            self._response_owner = None
+            return
+        logger.info(
+            "discord_realtime response_create guild=%s owner=%s queue=%d",
+            self.guild_id, owner, len(self._pending_injections),
+        )
+
+        async def _create() -> None:
+            try:
+                await transport.create_response(instructions=instructions)
+            except Exception:
+                logger.debug("response.create failed", exc_info=True)
+                if self._response_owner == owner:
+                    self._response_owner = None
+
+        self._schedule(_create())
 
     def on_output_transcript_delta(self, text: str, response_id: Optional[str]) -> None:
         if text:
@@ -342,22 +408,36 @@ class RealtimeVoiceLane:
             self.note_transcript("user", text)
 
     def on_function_call(self, name: str, args: dict, call_id: str) -> None:
-        """Provider function call → in-lane tool handler → function output."""
+        """Provider function call → in-lane tool → output + ONE continuation.
+
+        The function-call output continuation owns the immediate spoken
+        acknowledgement. The calling response is normally still open when
+        the arguments arrive, so the continuation is deferred to its
+        ``response.done`` — issuing ``response.create`` while a response is
+        active is exactly the overlap observed live.
+        """
         from .tools import handle_lane_tool
 
         output = handle_lane_tool(self, name, args or {})
+        logger.info(
+            "discord_realtime tool_call guild=%s name=%s call_id=%s",
+            self.guild_id, name, call_id,
+        )
         transport = self.transport
         if transport is None:
             return
 
-        async def _reply() -> None:
+        async def _send_output() -> None:
             try:
                 await transport.send_function_output(call_id, output)
-                await transport.create_response()
             except Exception:
                 logger.debug("function output send failed", exc_info=True)
 
-        self._schedule(_reply())
+        self._schedule(_send_output())
+        if self._response_owner is not None or self._provider_response_active:
+            self._pending_continuation = True
+        else:
+            self._own_and_create(f"fn:{call_id}")
 
     def on_transport_closed(self, exc: Optional[BaseException]) -> None:
         """Provider socket dropped outside our control.
@@ -412,9 +492,18 @@ class RealtimeVoiceLane:
         """Claim + queue one typed worker event. False → dropped as stale."""
         if self._stopped or not self.registry.claim_delivery(event):
             self.telemetry.incr("stale_events_dropped")
+            logger.info(
+                "discord_realtime stale_event_dropped guild=%s dispatch=%s type=%s",
+                self.guild_id, event.dispatch_id, event.type,
+            )
             return False
         self.telemetry.record_ms(
             "worker_event_latency_ms", (self._clock() - event.ts) * 1000.0
+        )
+        logger.info(
+            "discord_realtime worker_event guild=%s dispatch=%s type=%s queue=%d",
+            self.guild_id, event.dispatch_id, event.type,
+            len(self._pending_injections) + 1,
         )
         self.delivered_events.append(event)
         self._pending_injections.append(event)
@@ -433,30 +522,49 @@ class RealtimeVoiceLane:
         self.deliver_worker_event(event)
 
     def _try_flush_injections(self) -> None:
-        """Inject queued events when neither the user nor a response is live."""
-        if self._user_speaking or self._response_active:
-            return
+        """Advance the event queue under the single-response invariant.
+
+        ``started`` events are context-only: injected as conversation items
+        without ever creating a response (the function-call continuation owns
+        the acknowledgement — a second create here was the live overlap bug).
+        Every other event takes the in-flight slot; at most one is advanced
+        per response cycle, the rest wait for ``response.done``.
+        """
         transport = self.transport
-        if transport is None:
+        if transport is None or self._user_speaking:
             return
         while self._pending_injections:
-            event = self._pending_injections.popleft()
-            self._schedule(self._inject_event(transport, event))
+            event = self._pending_injections[0]
+            if event.type == "started":
+                self._pending_injections.popleft()
+                self._schedule(self._inject_item_only(transport, event))
+                continue
+            if self._response_owner is not None or self._provider_response_active:
+                return  # slot busy — this event goes out on response.done
+            self._pending_injections.popleft()
+            self._response_owner = f"event:{event.dispatch_id}"
+            logger.info(
+                "discord_realtime response_create guild=%s owner=%s queue=%d",
+                self.guild_id, self._response_owner, len(self._pending_injections),
+            )
+            self._schedule(self._inject_event_owned(transport, event))
+            return
 
-    async def _inject_event(self, transport: Any, event: Any) -> None:
+    async def _inject_item_only(self, transport: Any, event: Any) -> None:
         try:
             await transport.inject_item("system", self._render_event(event))
-            await self._respond_to_event(transport, event)
+        except Exception:
+            logger.debug("worker event item injection failed", exc_info=True)
+
+    async def _inject_event_owned(self, transport: Any, event: Any) -> None:
+        owner = f"event:{event.dispatch_id}"
+        try:
+            await transport.inject_item("system", self._render_event(event))
+            await transport.create_response()
         except Exception:
             logger.debug("worker event injection failed", exc_info=True)
-
-    async def _respond_to_event(self, transport: Any, event: Any) -> None:
-        """Trigger the spoken reaction to an injected event (native path).
-
-        Overridden behavior for figure-bearing sourced completions lands in
-        the exact-TTS slice (ADR D13): those never ride a native response.
-        """
-        await transport.create_response()
+            if self._response_owner == owner:
+                self._response_owner = None
 
     @staticmethod
     def _render_event(event: Any) -> str:
@@ -548,6 +656,29 @@ class RealtimeVoiceLane:
                 pass
 
 
+def _principal_provider_for(adapter: Any, text_channel_id: Optional[int]):
+    """Provider resolving the worker principal from the gateway runner.
+
+    Uses ``GatewayRunner.build_realtime_worker_principal`` — the same
+    model/provider/toolset resolution every gateway agent goes through.
+    Returns None (fail closed) when the runner or credentials are absent;
+    the bridge turns that into one clear failed event, never a silent drop.
+    """
+
+    def _provider():
+        runner = getattr(adapter, "gateway_runner", None)
+        build = getattr(runner, "build_realtime_worker_principal", None)
+        if not callable(build):
+            return None
+        try:
+            return build(chat_id=str(text_channel_id or ""))
+        except Exception:
+            logger.warning("realtime worker principal build failed", exc_info=True)
+            return None
+
+    return _provider
+
+
 def create_lane(
     *,
     adapter: Any,
@@ -557,10 +688,10 @@ def create_lane(
     raw_config: Optional[dict] = None,
     transport_factory: Optional[Callable[..., Any]] = None,
 ) -> RealtimeVoiceLane:
-    """Build a lane for a guild from the raw config mapping."""
+    """Build a PRODUCTION lane: transport + worker bridge + outbox wired."""
     config = load_realtime_voice_config(raw_config)
     text_channel_id = getattr(adapter, "_voice_text_channels", {}).get(guild_id)
-    return RealtimeVoiceLane(
+    lane = RealtimeVoiceLane(
         guild_id=guild_id,
         text_channel_id=text_channel_id,
         config=config,
@@ -570,3 +701,15 @@ def create_lane(
         receiver=receiver,
         transport_factory=transport_factory,
     )
+    # Production wiring — the live "worker dispatch unavailable" defect was
+    # this bridge never being instantiated outside tests.
+    from .outbox import DiscordTextOutbox
+    from .worker_bridge import WorkerBridge
+
+    lane.worker_bridge = WorkerBridge(
+        lane=lane,
+        adapter=adapter,
+        outbox=DiscordTextOutbox(adapter=adapter, lane=lane),
+        principal_provider=_principal_provider_for(adapter, text_channel_id),
+    )
+    return lane

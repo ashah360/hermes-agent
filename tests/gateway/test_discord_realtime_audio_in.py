@@ -134,6 +134,9 @@ class TestLaneAudioFlow:
                 order.append("cancel")
 
         lane.transport = _OrderedTransport()
+        # Cancel discipline: provider cancel only fires for an ACTIVE
+        # response (idle speech start must not spam response.cancel).
+        lane.on_response_created("r1")
         lane.on_user_speech_started()
         await lane.stop()
 

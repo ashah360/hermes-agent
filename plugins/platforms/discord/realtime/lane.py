@@ -90,10 +90,24 @@ class RealtimeVoiceLane:
         self._demotion_buffer_bytes = 0
         self._demoted = False
 
-        # ── Dispatch registry (ownership epochs; slice: worker bridge) ──
+        # ── Dispatch registry (ownership epochs; ADR D8) ──
         from .events import DispatchRegistry
 
         self.registry = DispatchRegistry(clock=clock)
+
+        # ── Worker events: safe-boundary reinjection queue (ADR D7) ──
+        self.delivered_events: list = []       # claim-passed events, in order
+        self._pending_injections: Deque[Any] = collections.deque()
+        self._user_speaking = False
+        self._response_active = False
+        self._result_payloads: dict = {}       # dispatch_id -> result payload
+        self.last_speaker_user_id = 0
+
+        # ── Exact transcript window (rollover restore, ADR D10) ──
+        self._transcript: Deque[Tuple[str, str]] = collections.deque(
+            maxlen=max(4, config.transcript_window_turns)
+        )
+        self._output_transcript_parts: list = []
 
         self._stopped = False
 
@@ -264,9 +278,14 @@ class RealtimeVoiceLane:
     # ------------------------------------------------------------------
 
     def on_user_speech_started(self) -> None:
-        """Server-VAD speech start: immediate barge-in on the audio plane."""
+        """Server-VAD speech start: immediate barge-in on the audio plane.
+
+        Bumps ``turn_seq`` and silences playback — it NEVER touches dispatch
+        ownership (ADR D8): follow-up speech must not stale a live worker.
+        """
         started = self._clock()
         self.turn_seq += 1
+        self._user_speaking = True
         self._clear_playback()
         if self.transport is not None:
             try:
@@ -279,6 +298,8 @@ class RealtimeVoiceLane:
     def on_user_speech_stopped(self) -> None:
         self._speech_stopped_at = self._clock()
         self._first_audio_recorded = False
+        self._user_speaking = False
+        self._try_flush_injections()
 
     def on_response_audio_delta(self, pcm_24k_mono: bytes) -> None:
         """Provider audio delta → mixer stream child (Discord-geometry PCM)."""
@@ -296,11 +317,155 @@ class RealtimeVoiceLane:
         child.feed(realtime_pcm_to_discord(pcm_24k_mono))
         self.telemetry.gauge("audio_out_queue_depth_ms", child.pending_ms())
 
+    def on_response_created(self, response_id: Optional[str]) -> None:
+        self._response_active = True
+
     def on_response_done(self) -> None:
         child = self._stream_child
         if child is not None:
             child.end()
             self._stream_child = None
+        self._response_active = False
+        if self._output_transcript_parts:
+            self.note_transcript("assistant", "".join(self._output_transcript_parts))
+            self._output_transcript_parts = []
+        self._try_flush_injections()
+
+    def on_output_transcript_delta(self, text: str, response_id: Optional[str]) -> None:
+        if text:
+            self._output_transcript_parts.append(text)
+
+    def on_input_transcript(self, text: str) -> None:
+        if text:
+            self.note_transcript("user", text)
+
+    def on_function_call(self, name: str, args: dict, call_id: str) -> None:
+        """Provider function call → in-lane tool handler → function output."""
+        from .tools import handle_lane_tool
+
+        output = handle_lane_tool(self, name, args or {})
+        transport = self.transport
+        if transport is None:
+            return
+
+        async def _reply() -> None:
+            try:
+                await transport.send_function_output(call_id, output)
+                await transport.create_response()
+            except Exception:
+                logger.debug("function output send failed", exc_info=True)
+
+        self._schedule(_reply())
+
+    def on_transport_closed(self, exc: Optional[BaseException]) -> None:
+        """Provider socket dropped outside our control (reconnect: ADR D2)."""
+        self.telemetry.incr("transport_drops")
+
+    # ------------------------------------------------------------------
+    # Worker events: claim → queue → inject at a safe boundary (ADR D7/D8)
+    # ------------------------------------------------------------------
+
+    def deliver_worker_event(self, event: Any) -> bool:
+        """Claim + queue one typed worker event. False → dropped as stale."""
+        if self._stopped or not self.registry.claim_delivery(event):
+            self.telemetry.incr("stale_events_dropped")
+            return False
+        self.telemetry.record_ms(
+            "worker_event_latency_ms", (self._clock() - event.ts) * 1000.0
+        )
+        self.delivered_events.append(event)
+        self._pending_injections.append(event)
+        self._try_flush_injections()
+        return True
+
+    def deliver_worker_event_threadsafe(self, event: Any) -> None:
+        """Executor-thread-safe delivery (bridge workers run off-loop)."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(self.deliver_worker_event, event)
+                return
+            except RuntimeError:
+                pass
+        self.deliver_worker_event(event)
+
+    def _try_flush_injections(self) -> None:
+        """Inject queued events when neither the user nor a response is live."""
+        if self._user_speaking or self._response_active:
+            return
+        transport = self.transport
+        if transport is None:
+            return
+        while self._pending_injections:
+            event = self._pending_injections.popleft()
+            self._schedule(self._inject_event(transport, event))
+
+    async def _inject_event(self, transport: Any, event: Any) -> None:
+        try:
+            await transport.inject_item("system", self._render_event(event))
+            await self._respond_to_event(transport, event)
+        except Exception:
+            logger.debug("worker event injection failed", exc_info=True)
+
+    async def _respond_to_event(self, transport: Any, event: Any) -> None:
+        """Trigger the spoken reaction to an injected event (native path).
+
+        Overridden behavior for figure-bearing sourced completions lands in
+        the exact-TTS slice (ADR D13): those never ride a native response.
+        """
+        await transport.create_response()
+
+    @staticmethod
+    def _render_event(event: Any) -> str:
+        lines = [
+            f"[background worker update] status={event.type} "
+            f"dispatch={event.dispatch_id}",
+            event.spoken_hint,
+        ]
+        if event.sources:
+            refs = "; ".join(
+                f"{s.get('title', 'source')} ({s.get('url', '')}, fetched {s.get('fetched_at', '?')})"
+                for s in event.sources
+            )
+            lines.append(f"Sources: {refs}")
+        if event.detail_ref:
+            lines.append(
+                "Full details, tables, and citations are posted in the bound "
+                "text channel."
+            )
+        lines.append(
+            "React naturally and briefly in your own words; never read tables "
+            "or URLs aloud."
+        )
+        return "\n".join(lines)
+
+    def store_result_payload(self, dispatch_id: str, payload: dict) -> None:
+        self._result_payloads[dispatch_id] = dict(payload or {})
+
+    def result_payload_for(self, dispatch_id: str) -> Optional[dict]:
+        return self._result_payloads.get(dispatch_id)
+
+    # ------------------------------------------------------------------
+    # Exact transcript window (ADR D10)
+    # ------------------------------------------------------------------
+
+    def note_transcript(self, role: str, text: str) -> None:
+        text = (text or "").strip()
+        if text:
+            self._transcript.append((role, text))
+
+    def transcript_window(self) -> list:
+        return list(self._transcript)
+
+    def _schedule(self, coro) -> None:
+        loop = self._loop
+        try:
+            if loop is not None and loop.is_running():
+                loop.create_task(coro)
+                return
+            asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()
 
     def _ensure_stream_child(self) -> Any:
         if self._stream_child is not None and not self._stream_child.finished:

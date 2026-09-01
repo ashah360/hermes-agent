@@ -251,6 +251,27 @@ class TestRealNaClWithDAVE:
         assert sink.call_args.args[:2] == (42, 100)
         assert sink.call_args.args[2]
 
+    def test_dave_inference_never_broadens_beyond_sole_member(self):
+        """Two allowed members = ambiguous: never guess a user for DAVE.
+
+        The pre-Opus inference is scoped to EXACTLY one allowed channel
+        member; with two candidates the packet must take the passthrough
+        path (no dave.decrypt with a guessed id, no fabricated mapping)."""
+        key = _make_secret_key()
+        dave = MagicMock()
+        receiver = _make_voice_receiver(
+            key,
+            dave_session=dave,
+            allowed_user_ids={"42", "43"},
+            members=[SimpleNamespace(id=42), SimpleNamespace(id=43)],
+        )
+        packet = _build_encrypted_rtp_packet(key, b"\xf8\xff\xfe", ssrc=100)
+        receiver._on_packet(packet)
+
+        dave.decrypt.assert_not_called()
+        assert 100 not in receiver._ssrc_to_user
+        assert receiver.counters["dave_passthrough"] == 1
+
     def test_dave_unencrypted_error_passthrough(self):
         """DAVE raises 'Unencrypted' → use NaCl-decrypted data as-is."""
         key = _make_secret_key()

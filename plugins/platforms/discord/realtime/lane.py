@@ -656,13 +656,16 @@ class RealtimeVoiceLane:
                 pass
 
 
-def _principal_provider_for(adapter: Any, text_channel_id: Optional[int]):
+def _principal_provider_for(adapter: Any, lane: "RealtimeVoiceLane"):
     """Provider resolving the worker principal from the gateway runner.
 
     Uses ``GatewayRunner.build_realtime_worker_principal`` — the same
     model/provider/toolset resolution every gateway agent goes through.
-    Returns None (fail closed) when the runner or credentials are absent;
-    the bridge turns that into one clear failed event, never a silent drop.
+    Identity is read at BUILD time: the chat id stays fixed to the lane's
+    bound text channel, while the user id follows the lane's current
+    speaker (``last_speaker_user_id``) — never a 0 captured at join
+    forever. Returns None (fail closed) when the runner or credentials are
+    absent; the bridge turns that into one clear failed event.
     """
 
     def _provider():
@@ -670,8 +673,12 @@ def _principal_provider_for(adapter: Any, text_channel_id: Optional[int]):
         build = getattr(runner, "build_realtime_worker_principal", None)
         if not callable(build):
             return None
+        speaker = getattr(lane, "last_speaker_user_id", 0) or 0
         try:
-            return build(chat_id=str(text_channel_id or ""))
+            return build(
+                chat_id=str(lane.text_channel_id or ""),
+                user_id=str(speaker) if speaker else None,
+            )
         except Exception:
             logger.warning("realtime worker principal build failed", exc_info=True)
             return None
@@ -710,6 +717,6 @@ def create_lane(
         lane=lane,
         adapter=adapter,
         outbox=DiscordTextOutbox(adapter=adapter, lane=lane),
-        principal_provider=_principal_provider_for(adapter, text_channel_id),
+        principal_provider=_principal_provider_for(adapter, lane),
     )
     return lane

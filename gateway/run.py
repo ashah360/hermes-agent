@@ -23861,10 +23861,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._voice_key(Platform.DISCORD, str(chat_id)), "off"
             )
 
+        # Bind the text channel/source BEFORE the adapter join starts: the
+        # realtime lane (worker principal, outbox, projection) is constructed
+        # INSIDE join_voice_channel and must see the exact source. On any
+        # failure the prior values are restored — an existing valid binding
+        # from another live session is never blindly deleted.
+        _sentinel = object()
+        prior_text_channel = adapter._voice_text_channels.get(guild_id, _sentinel)
+        adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
+        prior_source = _sentinel
+        if hasattr(adapter, "_voice_sources"):
+            prior_source = adapter._voice_sources.get(guild_id, _sentinel)
+            adapter._voice_sources[guild_id] = event.source.to_dict()
+
+        def _rollback_prebind() -> None:
+            if prior_text_channel is _sentinel:
+                adapter._voice_text_channels.pop(guild_id, None)
+            else:
+                adapter._voice_text_channels[guild_id] = prior_text_channel
+            if hasattr(adapter, "_voice_sources"):
+                if prior_source is _sentinel:
+                    adapter._voice_sources.pop(guild_id, None)
+                else:
+                    adapter._voice_sources[guild_id] = prior_source
+
         try:
             success = await adapter.join_voice_channel(voice_channel)
         except Exception as e:
             logger.warning("Failed to join voice channel: %s", e)
+            _rollback_prebind()
             adapter._voice_input_callback = None
             err_lower = str(e).lower()
             if "pynacl" in err_lower or "nacl" in err_lower or "davey" in err_lower:
@@ -23875,9 +23900,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return f"Failed to join voice channel: {e}"
 
         if success:
-            adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
-            if hasattr(adapter, "_voice_sources"):
-                adapter._voice_sources[guild_id] = event.source.to_dict()
+            # Prebound values are the current truth — retain them.
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
@@ -23885,7 +23908,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
             )
-        # Join failed — clear callback
+        # Join failed — restore prior binding and clear callback
+        _rollback_prebind()
         adapter._voice_input_callback = None
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
 

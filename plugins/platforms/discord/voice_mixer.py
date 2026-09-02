@@ -192,7 +192,7 @@ class StreamingMixerChild:
     __slots__ = (
         "name", "gain", "is_speech", "_lock", "_buf", "_ended", "_finished",
         "_state", "_prebuffer_bytes", "_rebuffer_bytes", "_max_bytes",
-        "stats", "_last_emit",
+        "stats", "_last_emit", "_on_finished", "_finished_notified",
     )
 
     def __init__(
@@ -203,6 +203,7 @@ class StreamingMixerChild:
         prebuffer_ms: int = STREAM_PREBUFFER_MS,
         rebuffer_ms: int = STREAM_REBUFFER_MS,
         max_buffer_ms: int = STREAM_MAX_BUFFER_MS,
+        on_finished=None,
     ):
         self.name = name
         self.gain = float(gain)
@@ -223,6 +224,12 @@ class StreamingMixerChild:
             "transitions": 0,
         }
         self._last_emit: Optional[str] = None
+        # Playback-idle signal: invoked EXACTLY ONCE, with this child, when
+        # the last queued frame has actually drained (finished transition).
+        # Fires on discord.py's sender thread — consumers must hop threads
+        # themselves (call_soon_threadsafe).
+        self._on_finished = on_finished
+        self._finished_notified = False
 
     @property
     def finished(self) -> bool:
@@ -271,8 +278,20 @@ class StreamingMixerChild:
             self.stats["transitions"] += 1
         self._last_emit = kind
 
+    def _notify_finished(self) -> None:
+        """Fire the playback-idle callback exactly once (outside the lock)."""
+        callback, self._on_finished = self._on_finished, None
+        if callback is None or self._finished_notified:
+            return
+        self._finished_notified = True
+        try:
+            callback(self)
+        except Exception:
+            logger.debug("StreamingMixerChild on_finished failed", exc_info=True)
+
     def read_frame(self) -> "Optional[np.ndarray]":
         np = _require_numpy()
+        finished_now = False
         with self._lock:
             if self._finished:
                 return None
@@ -282,35 +301,42 @@ class StreamingMixerChild:
                 if self._ended:
                     if depth == 0:
                         self._finished = True
-                        return None
-                    self._state = "playing"   # drain the sub-target tail
+                        finished_now = True
+                    else:
+                        self._state = "playing"   # drain the sub-target tail
                 elif depth >= self._prebuffer_bytes:
                     self._state = "playing"
                 else:
                     self._note_emit("silence")
                     return np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
 
-            # PLAYING
-            if depth >= FRAME_SIZE:
-                chunk = bytes(self._buf[:FRAME_SIZE])
-                del self._buf[:FRAME_SIZE]
-            elif self._ended:
-                if depth:
-                    chunk = bytes(self._buf) + b"\x00" * (FRAME_SIZE - depth)
-                    self._buf.clear()
+            chunk = None
+            if not finished_now:
+                # PLAYING
+                if depth >= FRAME_SIZE:
+                    chunk = bytes(self._buf[:FRAME_SIZE])
+                    del self._buf[:FRAME_SIZE]
+                elif self._ended:
+                    if depth:
+                        chunk = bytes(self._buf) + b"\x00" * (FRAME_SIZE - depth)
+                        self._buf.clear()
+                    else:
+                        self._finished = True
+                        finished_now = True
                 else:
-                    self._finished = True
-                    return None
-            else:
-                # Mid-stream underflow: one rebuffer episode, not a stutter.
-                self.stats["underruns"] += 1
-                self.stats["rebuffers"] += 1
-                self._state = "buffering"
-                self._prebuffer_bytes = self._rebuffer_bytes
-                self._note_emit("silence")
-                return np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
+                    # Mid-stream underflow: one rebuffer episode, not a stutter.
+                    self.stats["underruns"] += 1
+                    self.stats["rebuffers"] += 1
+                    self._state = "buffering"
+                    self._prebuffer_bytes = self._rebuffer_bytes
+                    self._note_emit("silence")
+                    return np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
 
-            self._note_emit("audio")
+            if not finished_now:
+                self._note_emit("audio")
+        if finished_now:
+            self._notify_finished()
+            return None
         samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
         if self.gain != 1.0:
             samples = samples * self.gain

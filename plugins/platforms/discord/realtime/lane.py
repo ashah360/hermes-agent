@@ -117,6 +117,11 @@ class RealtimeVoiceLane:
         self._provider_response_active = False
         self._cancel_sent = False
         self._pending_continuation = False
+        # Playback-idle boundary: response.done means GENERATION finished;
+        # the jitter mixer may still be draining seconds of audio. Worker
+        # events/continuations wait for BOTH (live "talks over himself" fix).
+        self._live_children: list = []
+        self._playback_defer_started_at: Optional[float] = None
 
         # ── Exact transcript window (rollover restore, ADR D10) ──
         self._transcript: Deque[Tuple[str, str]] = collections.deque(
@@ -478,14 +483,14 @@ class RealtimeVoiceLane:
         self._response_owner = None
         self._cancel_sent = False
         logger.info(
-            "discord_realtime response_done guild=%s owner=%s queue=%d continuation=%s",
+            "discord_realtime response_done guild=%s owner=%s queue=%d continuation=%s "
+            "playback_idle=%s",
             self.guild_id, prior_owner, len(self._pending_injections),
-            self._pending_continuation,
+            self._pending_continuation, self._playback_idle(),
         )
-        if self._pending_continuation:
-            self._pending_continuation = False
-            self._own_and_create("continuation")
-            return
+        # response.done is only HALF the boundary: playback may still be
+        # draining — _try_flush_injections gates on playback idle too, and
+        # the child-finished callback re-advances when the last frame plays.
         self._try_flush_injections()
 
     def _own_and_create(self, owner: str, *, instructions: Optional[str] = None) -> None:
@@ -545,10 +550,11 @@ class RealtimeVoiceLane:
                 logger.debug("function output send failed", exc_info=True)
 
         self._schedule(_send_output())
-        if self._response_owner is not None or self._provider_response_active:
-            self._pending_continuation = True
-        else:
-            self._own_and_create(f"fn:{call_id}")
+        # Continuations ride the same safe-boundary gate as worker events:
+        # no response in flight AND playback idle (never talk over the
+        # still-draining reply).
+        self._pending_continuation = True
+        self._try_flush_injections()
 
     def on_transport_closed(self, exc: Optional[BaseException]) -> None:
         """Provider socket dropped outside our control.
@@ -634,33 +640,59 @@ class RealtimeVoiceLane:
         self.deliver_worker_event(event)
 
     def _try_flush_injections(self) -> None:
-        """Advance the event queue under the single-response invariant.
+        """Advance continuations/events under the single-response invariant
+        AND the playback-idle boundary.
 
         ``started`` events are context-only: injected as conversation items
-        without ever creating a response (the function-call continuation owns
-        the acknowledgement — a second create here was the live overlap bug).
-        Every other event takes the in-flight slot; at most one is advanced
-        per response cycle, the rest wait for ``response.done``.
+        without ever creating a response. Everything that CREATES a response
+        (function-call continuations, worker events) requires: no user
+        speech, no response in flight, and the mixer fully drained —
+        response.done alone is not a safe boundary (generation ends seconds
+        before playback; injecting earlier overlapped Jeeves over himself
+        live). Worker paths never clear playback; they wait for it.
         """
         transport = self.transport
         if transport is None or self._user_speaking:
             return
-        while self._pending_injections:
-            event = self._pending_injections[0]
-            if event.type == "started":
-                self._pending_injections.popleft()
-                self._schedule(self._inject_item_only(transport, event))
-                continue
-            if self._response_owner is not None or self._provider_response_active:
-                return  # slot busy — this event goes out on response.done
-            self._pending_injections.popleft()
-            self._response_owner = f"event:{event.dispatch_id}"
-            logger.info(
-                "discord_realtime response_create guild=%s owner=%s queue=%d",
-                self.guild_id, self._response_owner, len(self._pending_injections),
-            )
-            self._schedule(self._inject_event_owned(transport, event))
+        # Context-only items may flow during playback (no audio impact).
+        while self._pending_injections and self._pending_injections[0].type == "started":
+            event = self._pending_injections.popleft()
+            self._schedule(self._inject_item_only(transport, event))
+        has_response_work = self._pending_continuation or bool(self._pending_injections)
+        if not has_response_work:
             return
+        if self._response_owner is not None or self._provider_response_active:
+            return  # slot busy — re-advanced on response.done
+        if not self._playback_idle():
+            # Defer until the mixer drains; the child-finished callback
+            # re-advances. Counted once per defer episode.
+            if self._playback_defer_started_at is None:
+                self._playback_defer_started_at = self._clock()
+                self.telemetry.incr("injections_deferred_playback")
+                logger.info(
+                    "discord_realtime injection_deferred_playback guild=%s "
+                    "queue=%d continuation=%s",
+                    self.guild_id, len(self._pending_injections),
+                    self._pending_continuation,
+                )
+            return
+        if self._playback_defer_started_at is not None:
+            self.telemetry.record_ms(
+                "injection_playback_defer_ms",
+                (self._clock() - self._playback_defer_started_at) * 1000.0,
+            )
+            self._playback_defer_started_at = None
+        if self._pending_continuation:
+            self._pending_continuation = False
+            self._own_and_create("continuation")
+            return
+        event = self._pending_injections.popleft()
+        self._response_owner = f"event:{event.dispatch_id}"
+        logger.info(
+            "discord_realtime response_create guild=%s owner=%s queue=%d",
+            self.guild_id, self._response_owner, len(self._pending_injections),
+        )
+        self._schedule(self._inject_event_owned(transport, event))
 
     async def _inject_item_only(self, transport: Any, event: Any) -> None:
         try:
@@ -743,10 +775,42 @@ class RealtimeVoiceLane:
                 from ..voice_mixer import StreamingMixerChild
             except ImportError:
                 from plugins.platforms.discord.voice_mixer import StreamingMixerChild
-        child = StreamingMixerChild(f"realtime-{self.guild_id}")
+        child = StreamingMixerChild(
+            f"realtime-{self.guild_id}", on_finished=self._child_finished_threadsafe
+        )
         mixer.attach_stream(child)
         self._stream_child = child
+        self._live_children.append(child)
         return child
+
+    # ------------------------------------------------------------------
+    # Playback-idle signal (mixer sender thread → loop thread)
+    # ------------------------------------------------------------------
+
+    def _child_finished_threadsafe(self, child: Any) -> None:
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(self._on_child_finished, child)
+                return
+            except RuntimeError:
+                pass
+        self._on_child_finished(child)
+
+    def _on_child_finished(self, child: Any) -> None:
+        try:
+            self._live_children.remove(child)
+        except ValueError:
+            pass
+        if self._playback_idle():
+            self._try_flush_injections()
+
+    def _playback_idle(self) -> bool:
+        """True when no attached stream child still has audio to play."""
+        self._live_children = [
+            c for c in self._live_children if not getattr(c, "finished", True)
+        ]
+        return not self._live_children
 
     def _mixer(self) -> Any:
         adapter = self._adapter
@@ -755,11 +819,21 @@ class RealtimeVoiceLane:
         return getattr(adapter, "_voice_mixers", {}).get(self.guild_id)
 
     def _clear_playback(self) -> None:
+        """USER-initiated silencing only (barge-in/stop/demote) — worker
+        events and continuations never call this; they wait for playback."""
         child = self._stream_child
         if child is not None:
             child.clear()  # discards AND marks done (barge-in contract)
             self._absorb_stream_stats(child)
             self._stream_child = None
+        # Cleared children die within one mixer frame: mark playback idle now.
+        for stale in self._live_children:
+            try:
+                stale.clear()
+            except Exception:
+                pass
+        self._live_children = []
+        self._playback_defer_started_at = None
         adapter = self._adapter
         if adapter is not None and hasattr(adapter, "interrupt_voice_playback"):
             try:

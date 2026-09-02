@@ -26,6 +26,7 @@ def identity_fixture():
     home.mkdir(parents=True, exist_ok=True)
     (home / "SOUL.md").write_text(
         "# Jeeves\n\nYou are Jeeves, Shaan's executive agent. Dry wit, precise.\n"
+        "Arman is the operator; Ghost handles deployments.\n"
         "\n## Style\n\nSpeak plainly. Numbers matter.\n",
         encoding="utf-8",
     )
@@ -69,16 +70,44 @@ class TestProjectionSources:
         assert "jeeves-log" in proj
         assert "Shaan" in proj
 
-    def test_authority_style_and_approval_contracts_present(self, identity_fixture):
+    def test_agency_tone_and_grounding_contracts_present(self, identity_fixture):
         proj = _build()
-        # Authority contract: dispatch-before-figures rule.
+        low = proj.lower()
+        # Agency: dispatch IS Jeeves's own hands — immediate, same turn.
+        assert "you are jeeves" in low
+        assert "your own hands" in low
+        assert "immediately" in low
         assert "hermes_dispatch" in proj
-        assert "never state business or data figures" in proj.lower()
+        # Numeric grounding stays (correctness, not restriction).
+        assert "never state business or data figures" in low
+        # Tone contract: rudeness never changes whether the work happens.
+        assert "profanity" in low
+        assert "never lecture" in low
         # Style contract: no canned acks, no tool-name narration.
-        assert "never use canned" in proj.lower()
-        assert "tool names" in proj.lower()
-        # Approval boundary reflects the default auto-deny posture.
-        assert "approval" in proj.lower()
+        assert "never use canned" in low
+        assert "tool names" in low
+        # SOUL identity passes through untouched (Arman/Ghost present).
+        assert "Arman is the operator" in proj
+        assert "Ghost handles deployments" in proj
+
+    def test_contracts_contain_no_restriction_or_separate_entity_language(self):
+        """Principal amendment: nothing is ever restricted, and the worker
+        machinery is never framed as a separate entity. Asserted on the
+        module contract constants (SOUL.md content is the user's own)."""
+        from plugins.platforms.discord.realtime import projection as proj_mod
+
+        contracts = " ".join([
+            proj_mod._AGENCY_CONTRACT,
+            proj_mod._AUTHORITY_CONTRACT,
+            proj_mod._TONE_CONTRACT,
+            proj_mod._STYLE_CONTRACT,
+        ]).lower()
+        for forbidden in ("approv", "permission", "cannot", "not allowed",
+                          "blocked on", "background worker", "backend"):
+            assert forbidden not in contracts, f"restriction language: {forbidden!r}"
+        # And no Approvals section exists at all any more.
+        assert not hasattr(proj_mod, "_APPROVAL_CONTRACT_AUTO_DENY")
+        assert not hasattr(proj_mod, "_APPROVAL_CONTRACT_AUTO_APPROVE")
 
     def test_fallback_identity_without_soul_md(self):
         # No SOUL.md in the temp home → DEFAULT_AGENT_IDENTITY fallback.

@@ -33,9 +33,12 @@ class RealtimeVoiceConfig:
     transcript_window_turns: int = 40
     demotion_buffer_seconds: float = 10.0
     # GA nested input transcription (audio.input.transcription.model).
-    # Empty (default) omits the block entirely — the minimal live vertical
-    # does not require input transcripts.
-    input_transcription_model: str = ""
+    # On by default: live sessions were unreviewable without transcripts.
+    # Empty string disables the block entirely.
+    input_transcription_model: str = "gpt-4o-mini-transcribe"
+    # Persist user/assistant transcripts (INFO line + JSONL under
+    # ~/.hermes/logs/discord_realtime_transcript.jsonl).
+    transcript_logging: bool = True
     # audio.input.turn_detection type. Production default is server_vad —
     # live logs showed semantic_vad holding turns open 12-29s, while
     # server_vad measured ~590ms speech-end->speech_stopped in the provider
@@ -150,6 +153,9 @@ def load_realtime_voice_config(raw: Optional[Mapping[str, Any]]) -> RealtimeVoic
             raw.get("input_transcription_model").strip()
             if isinstance(raw.get("input_transcription_model"), str)
             else defaults.input_transcription_model
+        ),
+        transcript_logging=_as_bool(
+            raw.get("transcript_logging"), defaults.transcript_logging
         ),
         turn_detection_type=_as_str(
             raw.get("turn_detection_type"), defaults.turn_detection_type

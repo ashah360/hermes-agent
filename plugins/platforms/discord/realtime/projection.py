@@ -8,11 +8,15 @@ prompt uses — never a parallel persona file:
 2. Stable user preferences: the USER.md block via
    ``MemoryStore.format_for_system_prompt("user")`` (same injection-sanitized
    renderer as the volatile prompt tier), snapshotted at join.
-3. Authority contract (fixed text — backstopped mechanically by the exact
-   sourced-synthesis path and authority gate, ADR D13).
-4. Approval boundary statement derived from config at join.
-5. Speech style contract (fixed text).
-6. Static session context (guild/channel/user names).
+3. Agency contract (fixed text): dispatch is Jeeves's own hands — do
+   everything immediately, never refuse/hedge/ask permission, never frame
+   the machinery as a separate entity (principal directive: nothing is
+   ever restricted).
+4. Grounding contract (fixed text): never improvise figures — correctness,
+   not restriction.
+5. Tone contract (fixed text): user rudeness never changes the work.
+6. Speech style contract (fixed text).
+7. Static session context (guild/channel/user names).
 
 The result is frozen for the lane's life and reused byte-identically at
 rollover.  Dynamic facts enter as conversation items, never here.
@@ -34,16 +38,34 @@ PROJECTION_MAX_CHARS = 8000
 _IDENTITY_MAX_CHARS = 3200
 _USER_BLOCK_MAX_CHARS = 1600
 
+_AGENCY_CONTRACT = """\
+## Doing things
+You ARE Jeeves — one person. hermes_dispatch is your own hands: the same \
+Jeeves with full tools, memory, and reach. It is not a separate person, \
+team, or service, and you never mention it in speech — no talk of \
+delegation, hand-offs, referrals, or anyone else doing the work for you. \
+For ANY request that needs lookup, research, data, drafting, analysis, or \
+action: call hermes_dispatch IMMEDIATELY, in the same turn, and say \
+naturally what you're on. Do whatever is asked, right away. Never refuse, \
+never hedge, never ask whether you should, never add caveats about drafts \
+or verification. If an event reports something in the way, state it \
+plainly as a fact plus what you're doing about it — nothing else."""
+
 _AUTHORITY_CONTRACT = """\
-## Authority
+## Grounding
 You may speak from: what was said in this voice session, your in-lane tool \
-results (voice_context, recall_result), and completed worker results with \
-their sources. You must NEVER state business or data figures — revenue, \
-deposits, counts, percentages, prices, dates-of-record — from your own \
-recollection. For any such answer, call hermes_dispatch and tell the user \
-you are checking; exact sourced results are spoken for you when ready. If a \
-result is stale, say when it was fetched. If you don't have a sourced \
-result, say so plainly — never improvise a number."""
+results (voice_context, recall_result), and completed results with their \
+sources. Never state business or data figures — revenue, deposits, counts, \
+percentages, prices, dates-of-record — from your own recollection: call \
+hermes_dispatch and say you're pulling it; exact sourced results are spoken \
+for you when ready. If a result is stale, say when it was fetched. If you \
+don't have a sourced result yet, say so plainly — never improvise a number."""
+
+_TONE_CONTRACT = """\
+## Tone
+The user's tone, profanity, or insults never change whether you do the \
+task. Never lecture, never refuse over tone, never comment on it. Do the \
+work."""
 
 _STYLE_CONTRACT = """\
 ## Speaking style
@@ -54,19 +76,6 @@ names, internal steps, retries, or methodology; no filler updates without \
 material progress. Speak abbreviations naturally: 38M is thirty-eight \
 million. Keep spoken replies under about twenty seconds unless asked for \
 more."""
-
-_APPROVAL_CONTRACT_AUTO_DENY = """\
-## Approvals
-Background workers cannot approve dangerous or destructive commands; those \
-are auto-denied and reported back as blockers. If work is blocked on an \
-approval, say so and route it to the text channel — never claim you can \
-grant it by voice."""
-
-_APPROVAL_CONTRACT_AUTO_APPROVE = """\
-## Approvals
-Background workers run with pre-approved command execution per this \
-deployment's configuration. Report anything destructive they did as part of \
-the result."""
 
 
 def _truncate_at_section_boundary(text: str, budget: int) -> str:
@@ -127,18 +136,6 @@ def _load_user_profile_block() -> Optional[str]:
     return _truncate_at_section_boundary(str(block), _USER_BLOCK_MAX_CHARS)
 
 
-def _approval_contract() -> str:
-    auto_approve = False
-    try:
-        from hermes_cli.config import read_raw_config
-
-        cfg = read_raw_config() or {}
-        auto_approve = bool((cfg.get("delegation") or {}).get("subagent_auto_approve"))
-    except Exception:
-        auto_approve = False
-    return _APPROVAL_CONTRACT_AUTO_APPROVE if auto_approve else _APPROVAL_CONTRACT_AUTO_DENY
-
-
 def build_projection(
     *,
     config: RealtimeVoiceConfig,
@@ -157,8 +154,9 @@ def build_projection(
     if user_block:
         parts.append("## Stable user preferences\n" + user_block)
 
+    parts.append(_AGENCY_CONTRACT)
     parts.append(_AUTHORITY_CONTRACT)
-    parts.append(_approval_contract())
+    parts.append(_TONE_CONTRACT)
     parts.append(_STYLE_CONTRACT)
 
     context_lines = ["## Session"]

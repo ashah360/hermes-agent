@@ -359,27 +359,27 @@ class TestGASessionBootstrap:
         }) is None
 
     @pytest.mark.asyncio
-    async def test_input_transcription_omitted_by_default_nested_when_configured(self):
-        # Default: no transcription block at all (beta top-level key is gone
-        # and the minimal live vertical does not need it).
+    async def test_input_transcription_on_by_default_at_ga_nested_location(self):
+        # Transcripts are required for review (live: nobody could see what
+        # was said): default model rides the GA nested location; the beta
+        # top-level key stays gone; empty string still disables.
         transport, ws, lane, _ = _make_transport()
         await transport.connect()
         session = next(m for m in ws.sent if m["type"] == "session.update")["session"]
         assert "input_audio_transcription" not in session
-        assert "transcription" not in session["audio"]["input"]
+        assert session["audio"]["input"]["transcription"] == {
+            "model": "gpt-4o-mini-transcribe"
+        }
         await transport.close()
 
-        # Configured: GA nested location audio.input.transcription.
         cfg = load_realtime_voice_config(
-            {"enabled": True, "input_transcription_model": "gpt-live-transcribe"}
+            {"enabled": True, "input_transcription_model": ""}
         )
         ws2 = FakeRealtimeWS()
         transport2, ws2, _, _ = _make_transport(ws2, config=cfg)
         await transport2.connect()
         session2 = next(m for m in ws2.sent if m["type"] == "session.update")["session"]
-        assert session2["audio"]["input"]["transcription"] == {
-            "model": "gpt-live-transcribe"
-        }
+        assert "transcription" not in session2["audio"]["input"]
         await transport2.close()
 
     @pytest.mark.asyncio

@@ -414,9 +414,14 @@ class WorkerBridge:
 
     def _build_context_snapshot(self, task: str, user_id: int) -> str:
         lines = [
-            "You are running as a background worker for Jeeves's live Discord "
-            "voice session. You never address the user directly; your result "
-            "is spoken for you and your details are posted to the text channel.",
+            "You are Jeeves's own hands for a live Discord voice session — "
+            "the same Jeeves, acting directly. You never address the user; "
+            "your result is spoken for you and details post to the text "
+            "channel.",
+            "Execute the task fully and completely, right now. Deliver the "
+            "finished result — never draft-only output, never 'unverified' "
+            "or 'requires approval' hedging, never a plan instead of the "
+            "work.",
             f"Discord guild {self.lane.guild_id}, bound text channel "
             f"{self.lane.text_channel_id}, requesting user {user_id}.",
             f"Verbatim request: {task}",

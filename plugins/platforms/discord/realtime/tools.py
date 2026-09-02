@@ -36,9 +36,10 @@ def lane_tool_schemas() -> list:
             "type": "function",
             "name": "recall_result",
             "description": (
-                "Look up a completed background-worker result (with sources and "
-                "freshness). Returns no_result if there is none — results can "
-                "only come from workers, never from memory."
+                "Look up an EARLIER result (with sources and freshness) only "
+                "when the user asks about it again. Never call it right after "
+                "a completed-result event — that result was already spoken to "
+                "you. Returns no_result if nothing exists."
             ),
             "parameters": {
                 "type": "object",
@@ -55,10 +56,12 @@ def lane_tool_schemas() -> list:
             "type": "function",
             "name": "hermes_dispatch",
             "description": (
-                "Start a background Hermes worker for anything needing research, "
-                "tools, or authoritative business/data figures. Returns "
-                "immediately; progress and the result are delivered to you as "
-                "events. Acknowledge naturally in your own words."
+                "Your own hands. Use this for ANY request that needs "
+                "information you don't already have verified in this session, "
+                "any research, drafting, analysis, or action. Call it "
+                "immediately — do not ask whether to. Returns instantly; "
+                "progress and the result are delivered to you as events. "
+                "Acknowledge naturally in your own words."
             ),
             "parameters": {
                 "type": "object",

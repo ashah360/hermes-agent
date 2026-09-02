@@ -122,6 +122,10 @@ class RealtimeVoiceLane:
         # events/continuations wait for BOTH (live "talks over himself" fix).
         self._live_children: list = []
         self._playback_defer_started_at: Optional[float] = None
+        # Double-speak guard: dispatch id of the last completed event whose
+        # result was spoken, cleared by genuine user speech. A recall_result
+        # for it (or a bare recall) right after is an echo, not a question.
+        self._last_completed_spoken: Optional[str] = None
 
         # ── Exact transcript window (rollover restore, ADR D10) ──
         self._transcript: Deque[Tuple[str, str]] = collections.deque(
@@ -409,6 +413,7 @@ class RealtimeVoiceLane:
                 pass
         self.telemetry.record_ms("barge_in_stop_ms", (self._clock() - started) * 1000.0)
         self.telemetry.incr("barge_ins")
+        self._last_completed_spoken = None  # real user speech resets echo guard
         logger.info(
             "discord_realtime provider_speech_started guild=%s turn=%d",
             self.guild_id, self.turn_seq,
@@ -474,7 +479,9 @@ class RealtimeVoiceLane:
             self._absorb_stream_stats(child)
             self._stream_child = None
         if self._output_transcript_parts:
-            self.note_transcript("assistant", "".join(self._output_transcript_parts))
+            assistant_text = "".join(self._output_transcript_parts)
+            self.note_transcript("assistant", assistant_text)
+            self._log_transcript("assistant", assistant_text)
             self._output_transcript_parts = []
         # Release the single in-flight slot, then advance exactly one step:
         # a pending function-call continuation outranks queued worker events.
@@ -522,6 +529,46 @@ class RealtimeVoiceLane:
     def on_input_transcript(self, text: str) -> None:
         if text:
             self.note_transcript("user", text)
+            self._log_transcript("user", text)
+
+    def _log_transcript(self, role: str, text: str) -> None:
+        """Persist one transcript line: INFO log + JSONL (review trail).
+
+        Gated by ``transcript_logging`` (default on — the live sessions were
+        unreviewable without it). Truncated log line; full text in the JSONL
+        alongside guild/turn/live dispatch ids.
+        """
+        if not self.config.transcript_logging:
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+        logger.info(
+            'discord_realtime transcript guild=%s turn=%d role=%s text="%s"',
+            self.guild_id, self.turn_seq, role,
+            text[:400].replace('"', "'"),
+        )
+        try:
+            import json as _json
+            import time as _time
+
+            from hermes_constants import get_hermes_home
+
+            log_dir = get_hermes_home() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            row = {
+                "ts": _time.time(),
+                "guild": self.guild_id,
+                "turn": self.turn_seq,
+                "role": role,
+                "text": text,
+                "dispatch_ids": [r.dispatch_id for r in self.registry.live_records()],
+            }
+            with open(log_dir / "discord_realtime_transcript.jsonl", "a",
+                      encoding="utf-8") as fp:
+                fp.write(_json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.debug("transcript jsonl append failed", exc_info=True)
 
     def on_function_call(self, name: str, args: dict, call_id: str) -> None:
         """Provider function call → in-lane tool → output + ONE continuation.
@@ -550,6 +597,19 @@ class RealtimeVoiceLane:
                 logger.debug("function output send failed", exc_info=True)
 
         self._schedule(_send_output())
+        # Double-speak guard (live 06:01-06:02): right after a completed
+        # result was spoken, the model tends to recall_result the SAME
+        # dispatch and speak it again. Answer the tool call (the provider
+        # needs the output) but create NO new spoken response.
+        if name == "recall_result" and self._last_completed_spoken:
+            target = str(args.get("dispatch_id") or "") if args else ""
+            if not target or target == self._last_completed_spoken:
+                self.telemetry.incr("recall_echo_suppressed")
+                logger.info(
+                    "discord_realtime recall_echo_suppressed guild=%s dispatch=%s",
+                    self.guild_id, self._last_completed_spoken,
+                )
+                return
         # Continuations ride the same safe-boundary gate as worker events:
         # no response in flight AND playback idle (never talk over the
         # still-draining reply).
@@ -688,6 +748,8 @@ class RealtimeVoiceLane:
             return
         event = self._pending_injections.popleft()
         self._response_owner = f"event:{event.dispatch_id}"
+        if event.type == "completed":
+            self._last_completed_spoken = event.dispatch_id
         logger.info(
             "discord_realtime response_create guild=%s owner=%s queue=%d",
             self.guild_id, self._response_owner, len(self._pending_injections),
